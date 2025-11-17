@@ -6,30 +6,30 @@ import pyarrow.dataset as ds
 import pyarrow.compute as pc
 from collections import defaultdict
 
-aapl_path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\alpha_options_raw\AAPL_options_2020-01-01_to_2025-11-16.parquet"
-df = pd.read_parquet(aapl_path)
-# ========= Preparation from raw data =========
-path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\exports\option_chain.parquet"
-
-dataset = ds.dataset(path, format="parquet")
+# aapl_path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\alpha_options_raw\AAPL_options_2020-01-01_to_2025-11-16.parquet"
+# df = pd.read_parquet(aapl_path)
+# # ========= Preparation from raw data =========
+# path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\exports\option_chain.parquet"
+#
+# dataset = ds.dataset(path, format="parquet")
 
 #######################  Creating usable csv from raw data  #######################################
 #
 # path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\exports\option_chain.parquet"
 #
-tickers = [
-    "NVDA", "MSFT", "AAPL", "AMZN", "META", "AVGO", "GOOGL", "GOOG", "BRK.B", "TSLA",
-    "JPM", "V", "LLY", "NFLX", "XOM", "MA", "WMT", "COST", "ORCL", "JNJ",
-    "HD", "PG", "ABBV", "BAC", "UNH",
-    "CRM", "ADBE", "PYPL", "AMD", "INTC", "CSCO", "MCD", "NKE", "WFC", "CVX",
-    "PEP", "KO", "DIS", "BA", "MRK", "MO", "IBM", "T", "GM", "CAT", "UPS", "DOW",
-    "PLTR", "TXN", "LIN", "AMAT"
-]
-cols = [
-    "date", "act_symbol", "expiration", "strike",
-    "call_put", "bid", "ask", "vol", "delta",
-    "gamma", "theta", "vega", "rho"
-]
+# tickers = [
+#     "NVDA", "MSFT", "AAPL", "AMZN", "META", "AVGO", "GOOGL", "GOOG", "BRK.B", "TSLA",
+#     "JPM", "V", "LLY", "NFLX", "XOM", "MA", "WMT", "COST", "ORCL", "JNJ",
+#     "HD", "PG", "ABBV", "BAC", "UNH",
+#     "CRM", "ADBE", "PYPL", "AMD", "INTC", "CSCO", "MCD", "NKE", "WFC", "CVX",
+#     "PEP", "KO", "DIS", "BA", "MRK", "MO", "IBM", "T", "GM", "CAT", "UPS", "DOW",
+#     "PLTR", "TXN", "LIN", "AMAT"
+# ]
+# cols = [
+#     "date", "act_symbol", "expiration", "strike",
+#     "call_put", "bid", "ask", "vol", "delta",
+#     "gamma", "theta", "vega", "rho"
+# ]
 
 # dataset = ds.dataset(path, format="parquet")
 #
@@ -114,19 +114,31 @@ cols = [
 # ========= Config =========
 SPOT_CSV = "spot_data.csv"
 EARNINGS_CSV = "earnings.csv"
+
+ALPHA_OPTIONS_DIR = "alpha_options_raw"
+USE_ALPHA_OPTIONS = True   # set False to fall back to old CSV logic
+
+# Moneyness filter
+MNY_MIN, MNY_MAX = 0.70, 1.30
+
 OPTIONS_DIR = "options"
 OPTIONS_SINGLE_CSV = "big_options_clean.csv"
 CACHE_DIR = "cache_iv"
-OUT_EXCEL = "earnings_iv_analysis.xlsx"
+OUT_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\earnings_iv_analysis.xlsx"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
+# UNIVERSE = [
+#     "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
+#     "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
+#     "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
+# ]
+
 UNIVERSE = [
-    "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
-    "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
-    "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
+    "MSFT","AAPL", "NVDA","META", "AVGO","GOOGL"
 ]
 
-YEARS = 3
+STUDY_START = pd.Timestamp("2020-01-01")
+STUDY_END   = pd.Timestamp("2025-11-14")
 PRE, POST = 10, 10
 BASELINE_PRE_TD, BASELINE_POST_TD = 30, 10
 MAX_ANCHOR_LAG_DAYS = 3
@@ -166,8 +178,6 @@ def _iv_from_price(target,S,K,T,is_call,r=R_RATE,q=Q_DIV,sigma0=0.3,tol=1e-6,max
             hi,sigma = (sigma,0.5*(lo+sigma)) if diff>0 else (hi,0.5*(sigma+hi)); lo = lo if diff>0 else sigma
         else:
             sigma = sigma_new
-    if sigma > 1.5:
-        yo = 2+2
     return float(sigma if np.isfinite(sigma) else np.nan)
 
 # ========= Spot loader =========
@@ -187,42 +197,138 @@ def pick_atm_row(sub: pd.DataFrame):
 
 # ========= Options loader + IV =========
 def _load_raw_options_for_ticker(tkr: str) -> pd.DataFrame:
+    """
+    Load raw options for one ticker.
+
+    Priority:
+    1) If USE_ALPHA_OPTIONS and alpha_option_raw/TICKER.parquet exists, use that.
+    2) Else, fall back to your previous CSV logic.
+    """
+
+    # --- 1) Try alpha_option_raw parquet ---
+    if USE_ALPHA_OPTIONS:
+        alpha_path = os.path.join(ALPHA_OPTIONS_DIR, f"{tkr}.parquet")
+        if os.path.exists(alpha_path):
+            df = pd.read_parquet(alpha_path)
+            if df.empty:
+                print(f"[{tkr}] alpha_option_raw parquet is empty")
+                return df
+
+            # Expected columns from your description:
+            # ['contractID','symbol','expiration','strike','type','last','mark',
+            #  'bid','bid_size','ask','ask_size','volume','open_interest',
+            #  'date','implied_volatility','delta','gamma','theta','vega','rho']
+
+            # Standardize date / expiry
+            if "date" not in df.columns:
+                raise ValueError(f"[{tkr}] alpha_option_raw: missing 'date'")
+            df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+
+            if "expiration" not in df.columns:
+                raise ValueError(f"[{tkr}] alpha_option_raw: missing 'expiration'")
+            df["expiry"] = pd.to_datetime(df["expiration"]).dt.normalize()
+
+            # strike
+            if "strike" not in df.columns:
+                raise ValueError(f"[{tkr}] alpha_option_raw: missing 'strike'")
+            df["strike"] = pd.to_numeric(df["strike"], errors="coerce")
+
+            # call / put
+            if "type" not in df.columns:
+                raise ValueError(f"[{tkr}] alpha_option_raw: missing 'type' (call/put)")
+            t = df["type"].astype(str).str.strip().str.upper()
+            df["is_call"] = t.isin(["C", "CALL"])
+
+            # mid price: prefer 'mark', then (bid+ask)/2, then 'last'
+            price_cols = {c.lower(): c for c in df.columns}
+            mid = None
+            if "mark" in price_cols:
+                mid = df[price_cols["mark"]]
+            elif "bid" in price_cols and "ask" in price_cols:
+                mid = 0.5 * (
+                    pd.to_numeric(df[price_cols["bid"]], errors="coerce")
+                    + pd.to_numeric(df[price_cols["ask"]], errors="coerce")
+                )
+            elif "last" in price_cols:
+                mid = pd.to_numeric(df[price_cols["last"]], errors="coerce")
+            else:
+                raise ValueError(f"[{tkr}] alpha_option_raw: no usable price column (mark/bid+ask/last)")
+
+            df["mid"] = mid.astype(float)
+            df = df[df["mid"] > 0].copy()
+
+            return df
+
+    # --- 2) Fallback: your previous CSV logic ---
     if OPTIONS_SINGLE_CSV and os.path.exists(OPTIONS_SINGLE_CSV):
         df = pd.read_csv(OPTIONS_SINGLE_CSV)
-        if "symbol" not in df.columns: raise ValueError("OPTIONS_SINGLE_CSV must have 'symbol'.")
-        df = df[df["symbol"]==tkr].copy()
+        if "symbol" not in df.columns:
+            raise ValueError("OPTIONS_SINGLE_CSV must have 'symbol'.")
+        df = df[df["symbol"] == tkr].copy()
     else:
-        path = os.path.join(OPTIONS_DIR,f"{tkr}_options.csv")
-        if not os.path.exists(path): print(f"[{tkr}] no options file"); return pd.DataFrame()
+        path = os.path.join(OPTIONS_DIR, f"{tkr}_options.csv")
+        if not os.path.exists(path):
+            print(f"[{tkr}] no options file")
+            return pd.DataFrame()
         df = pd.read_csv(path)
-    if df.empty: return df
-    if "date" in df.columns: df["date"] = pd.to_datetime(df["date"]).dt.normalize()
-    elif "time" in df.columns: df["date"] = pd.to_datetime(df["time"]).dt.normalize()
-    else: raise ValueError(f"[{tkr}] no 'date'/'time'")
-    if "expiry" not in df.columns and "expiration" in df.columns: df["expiry"] = pd.to_datetime(df["expiration"]).dt.normalize()
-    elif "expiry" in df.columns: df["expiry"] = pd.to_datetime(df["expiry"]).dt.normalize()
-    else: raise ValueError(f"[{tkr}] no 'expiry'/'expiration'")
-    if "strike" not in df.columns: raise ValueError(f"[{tkr}] no 'strike'")
+
+    if df.empty:
+        return df
+
+    if "date" in df.columns:
+        df["date"] = pd.to_datetime(df["date"]).dt.normalize()
+    elif "time" in df.columns:
+        df["date"] = pd.to_datetime(df["time"]).dt.normalize()
+    else:
+        raise ValueError(f"[{tkr}] no 'date'/'time'")
+
+    if "expiry" not in df.columns and "expiration" in df.columns:
+        df["expiry"] = pd.to_datetime(df["expiration"]).dt.normalize()
+    elif "expiry" in df.columns:
+        df["expiry"] = pd.to_datetime(df["expiry"]).dt.normalize()
+    else:
+        raise ValueError(f"[{tkr}] no 'expiry'/'expiration'")
+
+    if "strike" not in df.columns:
+        raise ValueError(f"[{tkr}] no 'strike'")
     df["strike"] = df["strike"].astype(float)
-    if "is_call" in df.columns: df["is_call"] = df["is_call"].astype(bool)
+
+    if "is_call" in df.columns:
+        df["is_call"] = df["is_call"].astype(bool)
     else:
-        right_col = next((c for c in ["right","option_type","cp_flag"] if c in df.columns), None)
-        if right_col is None: raise ValueError(f"[{tkr}] no call/put flag")
+        right_col = next((c for c in ["right", "option_type", "cp_flag", "type"] if c in df.columns), None)
+        if right_col is None:
+            raise ValueError(f"[{tkr}] no call/put flag")
         df[right_col] = df[right_col].astype(str).str.upper().str.strip()
-        df["is_call"] = df[right_col].isin(["C","CALL"])
-    cols = {c.lower():c for c in df.columns}
+        df["is_call"] = df[right_col].isin(["C", "CALL"])
+
+    cols = {c.lower(): c for c in df.columns}
     if "bid" in cols and "ask" in cols:
-        df["mid"] = 0.5*(df[cols["bid"]].astype(float)+df[cols["ask"]].astype(float))
+        df["mid"] = 0.5 * (df[cols["bid"]].astype(float) + df[cols["ask"]].astype(float))
     else:
-        price_col = next((cols[c] for c in ["last","lastprice","close","settle","price"] if c in cols), None)
-        if price_col is None: raise ValueError(f"[{tkr}] no price cols")
+        price_col = next((cols[c] for c in ["last", "lastprice", "close", "settle", "price"] if c in cols), None)
+        if price_col is None:
+            raise ValueError(f"[{tkr}] no price cols")
         df["mid"] = df[price_col].astype(float)
-    df = df[df["mid"]>0].copy()
+
+    df = df[df["mid"] > 0].copy()
     return df
 
-def get_options_with_iv_local(tkr, close_long, start, end, r=R_RATE, q_div=Q_DIV,
-                              use_cache=USE_CACHE, cache_prefix=CACHE_PREFIX):
-    cache_key = os.path.join(CACHE_DIR,f"{cache_prefix}_opt_{tkr}_{start:%Y%m%d}_{end:%Y%m%d}.parquet")
+def get_options_with_iv_local(
+    tkr,
+    close_long,
+    start,
+    end,
+    r=R_RATE,
+    q_div=Q_DIV,
+    use_cache=USE_CACHE,
+    cache_prefix=CACHE_PREFIX,
+):
+    cache_key = os.path.join(
+        CACHE_DIR, f"{cache_prefix}_opt_{tkr}_{start:%Y%m%d}_{end:%Y%m%d}.parquet"
+    )
+
+    # Try cache first
     if use_cache and os.path.exists(cache_key):
         try:
             df = pd.read_parquet(cache_key)
@@ -230,35 +336,128 @@ def get_options_with_iv_local(tkr, close_long, start, end, r=R_RATE, q_div=Q_DIV
                 df["date"] = pd.to_datetime(df["date"]).dt.normalize()
                 df["expiry"] = pd.to_datetime(df["expiry"]).dt.normalize()
                 return df
-        except Exception as e: print(f"[{tkr}] cache read fail: {e}")
+        except Exception as e:
+            print(f"[{tkr}] cache read fail: {e}")
+
+    # Load raw options
     df = _load_raw_options_for_ticker(tkr)
-    if df.empty: print(f"[{tkr}] no raw options"); return pd.DataFrame()
-    df = df[(df["date"]>=start) & (df["date"]<=end)].copy()
-    if df.empty: print(f"[{tkr}] no options in range"); return pd.DataFrame()
-    if not isinstance(close_long.index,pd.MultiIndex): raise ValueError("close_long must be MultiIndex")
-    key = pd.MultiIndex.from_arrays([np.full(len(df),tkr),df["date"]],names=["symbol","date"])
-    if (tkr,"spot") or (tkr,) in close_long.columns:
-        pass
-    try: df["spot"] = close_long.reindex(key)["spot"].values
-    except:
-        if tkr in close_long.columns: df["spot"] = close_long.reindex(df["date"])[tkr].values
-        else: print(f"[{tkr}] no spot in close_long"); return pd.DataFrame()
-    df = df.dropna(subset=["spot"]);
-    if df.empty: print(f"[{tkr}] no rows after merge spot"); return pd.DataFrame()
-    df["dte"] = (df["expiry"]-df["date"]).dt.days; df = df[df["dte"]>0].copy()
-    if df.empty: print(f"[{tkr}] no positive DTE"); return pd.DataFrame()
-    df["iv"] = [ _iv_from_price(float(rw["mid"]),float(rw["spot"]),float(rw["strike"]),
-                                 max(1e-6,rw["dte"]/365.0),bool(rw["is_call"]),r,q_div)
-                 for _,rw in df.iterrows() ]
-    df = df.replace([np.inf,-np.inf],np.nan).dropna(subset=["iv"])
-    if df.empty: print(f"[{tkr}] no valid IV"); return pd.DataFrame()
-    df["moneyness"] = df["strike"]/df["spot"]; df["symbol_under"] = tkr
-    df = df[["date","expiry","strike","is_call","spot","mid","iv","dte","moneyness","symbol_under"]]\
-           .sort_values(["date","expiry","strike"]).reset_index(drop=True)
+    if df.empty:
+        print(f"[{tkr}] no raw options")
+        return pd.DataFrame()
+
+    # Time filter
+    df = df[(df["date"] >= start) & (df["date"] <= end)].copy()
+    if df.empty:
+        print(f"[{tkr}] no options in range")
+        return pd.DataFrame()
+
+    # Attach spot
+    if not isinstance(close_long.index, pd.MultiIndex):
+        raise ValueError("close_long must be MultiIndex")
+
+    key = pd.MultiIndex.from_arrays(
+        [np.full(len(df), tkr), df["date"]],
+        names=["symbol", "date"],
+    )
+    try:
+        df["spot"] = close_long.reindex(key)["spot"].values
+    except Exception:
+        if tkr in close_long.columns:
+            df["spot"] = close_long.reindex(df["date"])[tkr].values
+        else:
+            print(f"[{tkr}] no spot in close_long")
+            return pd.DataFrame()
+
+    df = df.dropna(subset=["spot"])
+    if df.empty:
+        print(f"[{tkr}] no rows after merge spot")
+        return pd.DataFrame()
+
+    # DTE
+    df["dte"] = (df["expiry"] - df["date"]).dt.days
+    df = df[df["dte"] > 0].copy()
+    if df.empty:
+        print(f"[{tkr}] no positive DTE")
+        return pd.DataFrame()
+
+    # --- IV handling ---
+    # If we have an implied_volatility column, keep it where it's usable and only compute IV
+    # where it's missing / non-positive.
+    if "implied_volatility" in df.columns:
+        df["iv"] = pd.to_numeric(df["implied_volatility"], errors="coerce")
+    else:
+        df["iv"] = np.nan
+
+    mask_need_iv = df["iv"].isna() | (df["iv"] <= 0)
+
+    if mask_need_iv.any():
+        sub = df.loc[mask_need_iv].copy()
+
+        def _compute_iv_row(rw):
+            return _iv_from_price(
+                float(rw["mid"]),
+                float(rw["spot"]),
+                float(rw["strike"]),
+                max(1e-6, rw["dte"] / 365.0),
+                bool(rw["is_call"]),
+                r,
+                q_div,
+            )
+
+        df.loc[mask_need_iv, "iv"] = [
+            _compute_iv_row(rw) for _, rw in sub.iterrows()
+        ]
+
+    # Clean infinities / NaNs
+    df = df.replace([np.inf, -np.inf], np.nan).dropna(subset=["iv"])
+    if df.empty:
+        print(f"[{tkr}] no valid IV")
+        return pd.DataFrame()
+
+    # --- Moneyness filter ---
+    df["moneyness"] = df["strike"] / df["spot"]
+    df = df[(df["moneyness"] >= MNY_MIN) & (df["moneyness"] <= MNY_MAX)].copy()
+    if df.empty:
+        print(f"[{tkr}] no options after moneyness filter {MNY_MIN:.2f}-{MNY_MAX:.2f}")
+        return pd.DataFrame()
+
+    df["symbol_under"] = tkr
+
+    # Save a fully detailed cleaned version (original columns + added ones) back into alpha_option_raw
+    if USE_ALPHA_OPTIONS:
+        alpha_clean_path = os.path.join(ALPHA_OPTIONS_DIR, f"{tkr}_clean.parquet")
+        try:
+            df.to_parquet(alpha_clean_path, index=False)
+            # print(f"[{tkr}] cleaned options saved -> {alpha_clean_path}")
+        except Exception as e:
+            print(f"[{tkr}] failed to save cleaned options: {e}")
+
+    # Reduce to the columns the rest of the pipeline expects
+    df_out = df[
+        [
+            "date",
+            "expiry",
+            "strike",
+            "is_call",
+            "spot",
+            "mid",
+            "iv",
+            "dte",
+            "moneyness",
+            "symbol_under",
+        ]
+    ].sort_values(["date", "expiry", "strike"]).reset_index(drop=True)
+
+    # Cache
     if use_cache:
-        try: df.to_parquet(cache_key,index=False); print(f"[{tkr}] cached -> {cache_key}")
-        except Exception as e: print(f"[{tkr}] cache save fail: {e}")
-    return df
+        try:
+            df_out.to_parquet(cache_key, index=False)
+            print(f"[{tkr}] cached -> {cache_key}")
+        except Exception as e:
+            print(f"[{tkr}] cache save fail: {e}")
+
+    return df_out
+
 
 # ========= Build 3-case panels for one ticker =========
 def build_atm_panels_for_ticker(opt_df, earn_tkr, pre, post,
@@ -351,9 +550,14 @@ def build_opt_and_panels_for_ticker(tkr, earn_all, close_long,
 
 # ========= Load spot & earnings =========
 close_long = load_spot_close_long(SPOT_CSV)
-END_DATE = close_long.index.get_level_values("date").max()
-START_DATE = END_DATE - pd.Timedelta(days=365*YEARS)
-print(f"Spot window: {START_DATE.date()} to {END_DATE.date()}")
+spot_min = close_long.index.get_level_values("date").min()
+spot_max = close_long.index.get_level_values("date").max()
+
+END_DATE = min(STUDY_END.normalize(), spot_max)
+START_DATE = max(STUDY_START.normalize(), spot_min)
+
+print(f"Study window: {START_DATE.date()} to {END_DATE.date()} "
+      f"(spot range: {spot_min.date()}–{spot_max.date()})")
 
 earn = pd.read_csv(EARNINGS_CSV)
 earn["symbol"] = earn["symbol"].astype(str).str.upper()
@@ -475,35 +679,50 @@ bins_vrp = np.linspace(vrp.min(),vrp.max(),51)
 df_vrp_hist = pd.DataFrame({"BinLeft":bins_vrp[:-1],"BinRight":bins_vrp[1:],
                             "Count":np.histogram(vrp,bins=bins_vrp)[0]})
 
+# Computing the Aggregated panel for smart tables
+# === Aggregated panel: IV_abn and DTE per case, per t_rel ===
+agg = (
+    panel_clean[["CaseID", "t_rel", "IV_abn", "TTM_yrs"]]
+    .groupby(["CaseID", "t_rel"], as_index=False)
+    .agg(
+        IV_abn_mean=("IV_abn", "mean"),
+        TTM_yrs_mean=("TTM_yrs", "mean"),
+    )
+)
 
+# Pivot IV_abn
+iv_pivot = (
+    agg.pivot(index="t_rel", columns="CaseID", values="IV_abn_mean")
+    .rename(columns={
+        1: "IV_abn_Case1",
+        2: "IV_abn_Case2",
+        3: "IV_abn_Case3",
+    })
+)
+
+# Pivot TTM_yrs -> DTE in days
+dte_pivot = (
+    (agg.pivot(index="t_rel", columns="CaseID", values="TTM_yrs_mean") * 365.0)
+    .rename(columns={
+        1: "DTE_days_Case1",
+        2: "DTE_days_Case2",
+        3: "DTE_days_Case3",
+    })
+)
+
+# Combine IV_abn and DTE
+df_agg = (
+    iv_pivot
+    .join(dte_pivot, how="outer")
+    .sort_index()
+    .reset_index()  # keep t_rel as a column for plotting
+)
 
 # ========= Single Excel export (all sheets) =========
 with pd.ExcelWriter(OUT_EXCEL, engine="xlsxwriter") as w:
-    # raw panels per ticker/case
-    for tkr, cases in PANELS.items():
-        for case_id, df_case in cases.items():
-            if df_case is not None and not df_case.empty:
-                sheet = f"{tkr}_c{case_id}"[:31]
 
-                cols = [
-                    "symbol",
-                    "event_day",
-                    "case",
-                    "target_expiry",
-                    "date",
-                    "rel",
-                    "iv",
-                    "baseline_IV",
-                    "abn_IV",
-                    "spot",
-                    "strike",
-                    "moneyness",
-                    "is_call",
-                ]
-
-                # keep only the requested columns in that order
-                df_case[cols].to_excel(w, sheet_name=sheet, index=False)
     panel_clean.to_excel(w, sheet_name="panel_clean", index=False)
+    df_agg.to_excel(w, sheet_name="aggregated_panel_clean", index=False)
     event_features.to_excel(w, sheet_name="event_features", index=False)
     df_iv_hist.to_excel(w, sheet_name="plot_IVabn_hist", index=False)
     df_iv_vs_crush.to_excel(w, sheet_name="plot_IVabn_vs_Crush", index=False)
@@ -535,5 +754,32 @@ with pd.ExcelWriter(OUT_EXCEL, engine="xlsxwriter") as w:
     perf.to_excel(w, sheet_name="signal_perf")
     # <<< NEW: write OLS text summary >>>
     coef_table.to_excel(w, sheet_name="OLS_coef_table", index=False)
+
+
+    # raw panels per ticker/case
+    for tkr, cases in PANELS.items():
+        for case_id, df_case in cases.items():
+            if df_case is not None and not df_case.empty:
+                sheet = f"{tkr}_c{case_id}"[:31]
+
+                cols = [
+                    "symbol",
+                    "event_day",
+                    "case",
+                    "target_expiry",
+                    "date",
+                    "rel",
+                    "iv",
+                    "baseline_IV",
+                    "abn_IV",
+                    "spot",
+                    "strike",
+                    "moneyness",
+                    "is_call",
+                ]
+
+                # keep only the requested columns in that order
+                df_case[cols].to_excel(w, sheet_name=sheet, index=False)
+
 
 print(f"All outputs written to {OUT_EXCEL}")
