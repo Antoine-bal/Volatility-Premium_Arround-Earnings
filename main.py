@@ -6,6 +6,8 @@ import pyarrow.dataset as ds
 import pyarrow.compute as pc
 from collections import defaultdict
 
+aapl_path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\alpha_options_raw\AAPL_options_2020-01-01_to_2025-11-16.parquet"
+df = pd.read_parquet(aapl_path)
 # ========= Preparation from raw data =========
 path = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\exports\option_chain.parquet"
 
@@ -164,6 +166,8 @@ def _iv_from_price(target,S,K,T,is_call,r=R_RATE,q=Q_DIV,sigma0=0.3,tol=1e-6,max
             hi,sigma = (sigma,0.5*(lo+sigma)) if diff>0 else (hi,0.5*(sigma+hi)); lo = lo if diff>0 else sigma
         else:
             sigma = sigma_new
+    if sigma > 1.5:
+        yo = 2+2
     return float(sigma if np.isfinite(sigma) else np.nan)
 
 # ========= Spot loader =========
@@ -297,16 +301,30 @@ def build_atm_panels_for_ticker(opt_df, earn_tkr, pre, post,
                     if row is not None and np.isfinite(row["iv"]): ivs.append(float(row["iv"]))
                 if ivs: baseline_iv = float(np.mean(ivs))
             w_left,w_right = max(0,anchor_idx-pre),min(len(trading_days)-1,anchor_idx+post)
-            for i in range(w_left,w_right+1):
+            for i in range(w_left, w_right + 1):
                 d = trading_days[i]
-                row = pick_atm_row(df[(df["date"]==d)&(df["expiry"]==target)])
-                if row is None or not np.isfinite(row["iv"]): continue
-                iv_val = float(row["iv"]); rel = i-anchor_idx
+                row = pick_atm_row(df[(df["date"] == d) & (df["expiry"] == target)])
+                if row is None or not np.isfinite(row["iv"]):
+                    continue
+
+                iv_val = float(row["iv"])
+                rel = i - anchor_idx
+
                 panels[case].append({
-                    "symbol":symbol,"event_day":event_day,"case":case,
-                    "target_expiry":target,"date":d,"rel":rel,
-                    "iv":iv_val,"baseline_IV":baseline_iv,
-                    "abn_IV":iv_val-baseline_iv if np.isfinite(baseline_iv) else np.nan
+                    "symbol": symbol,
+                    "event_day": event_day,
+                    "case": case,
+                    "target_expiry": target,
+                    "date": d,
+                    "rel": rel,
+                    "iv": iv_val,
+                    "baseline_IV": baseline_iv,
+                    "abn_IV": iv_val - baseline_iv if np.isfinite(baseline_iv) else np.nan,
+                    # <<< NEW FIELDS >>>
+                    "spot": float(row["spot"]),
+                    "strike": float(row["strike"]),
+                    "moneyness": float(row["moneyness"]),
+                    "is_call": bool(row["is_call"]),
                 })
     for c in [1,2,3]:
         panels[c] = (pd.DataFrame(panels[c])
@@ -457,42 +475,62 @@ bins_vrp = np.linspace(vrp.min(),vrp.max(),51)
 df_vrp_hist = pd.DataFrame({"BinLeft":bins_vrp[:-1],"BinRight":bins_vrp[1:],
                             "Count":np.histogram(vrp,bins=bins_vrp)[0]})
 
-# ========= Regression + signals =========
-df_reg = event_features.dropna(subset=["Crush_1d","IV_abn_pre","TermSlope_pre","VRP_1d","R_0_1"]).copy()
-for c in ["IV_abn_pre","TermSlope_pre","VRP_1d"]:
-    df_reg[c+"_z"] = (df_reg[c]-df_reg[c].mean())/df_reg[c].std()
-y = df_reg["Crush_1d"]
-X = sm.add_constant(df_reg[["IV_abn_pre_z","TermSlope_pre_z","VRP_1d_z","R_0_1"]])
-model = sm.OLS(y,X).fit(cov_type="HC3")
-print(model.summary())
-coef_table = model.summary2().tables[1].reset_index()
-coef_table = coef_table.rename(columns={"index": "Variable"})
 
-df_reg["Signal_VolBuildup"] = -df_reg["IV_abn_pre_z"]
-df_reg["Signal_TermSlope"] = -df_reg["TermSlope_pre_z"]
-df_reg["Signal_Composite"] = 0.6*df_reg["Signal_VolBuildup"] + 0.4*df_reg["Signal_TermSlope"]
-df_reg["ImpliedMove_1d"] = df_reg["EV_1d"]
-df_reg["RealizedMove_1d"] = df_reg["R_0_1"].abs()
-df_reg["IVCrush_Impact"] = -df_reg["Crush_1d"]*np.sqrt(1/252)
-df_reg["PnL_proxy"] = df_reg["IVCrush_Impact"] + df_reg["RealizedMove_1d"] - df_reg["ImpliedMove_1d"]
-df_reg["Signal_quintile"] = pd.qcut(df_reg["Signal_Composite"],5,labels=False)+1
-perf = df_reg.groupby("Signal_quintile")["PnL_proxy"].mean().rename("MeanPnL").to_frame()
-print(perf)
 
 # ========= Single Excel export (all sheets) =========
 with pd.ExcelWriter(OUT_EXCEL, engine="xlsxwriter") as w:
     # raw panels per ticker/case
-    for tkr,cases in PANELS.items():
-        for case_id,df_case in cases.items():
+    for tkr, cases in PANELS.items():
+        for case_id, df_case in cases.items():
             if df_case is not None and not df_case.empty:
                 sheet = f"{tkr}_c{case_id}"[:31]
-                df_case.to_excel(w, sheet_name=sheet, index=False)
+
+                cols = [
+                    "symbol",
+                    "event_day",
+                    "case",
+                    "target_expiry",
+                    "date",
+                    "rel",
+                    "iv",
+                    "baseline_IV",
+                    "abn_IV",
+                    "spot",
+                    "strike",
+                    "moneyness",
+                    "is_call",
+                ]
+
+                # keep only the requested columns in that order
+                df_case[cols].to_excel(w, sheet_name=sheet, index=False)
     panel_clean.to_excel(w, sheet_name="panel_clean", index=False)
     event_features.to_excel(w, sheet_name="event_features", index=False)
     df_iv_hist.to_excel(w, sheet_name="plot_IVabn_hist", index=False)
     df_iv_vs_crush.to_excel(w, sheet_name="plot_IVabn_vs_Crush", index=False)
     df_termslope_vs_crush.to_excel(w, sheet_name="plot_TermSlope_vs_Crush", index=False)
     df_vrp_hist.to_excel(w, sheet_name="plot_VRP1d_hist", index=False)
+
+    # ========= Regression + signals =========
+    df_reg = event_features.dropna(subset=["Crush_1d", "IV_abn_pre", "TermSlope_pre", "VRP_1d", "R_0_1"]).copy()
+    for c in ["IV_abn_pre", "TermSlope_pre", "VRP_1d"]:
+        df_reg[c + "_z"] = (df_reg[c] - df_reg[c].mean()) / df_reg[c].std()
+    y = df_reg["Crush_1d"]
+    X = sm.add_constant(df_reg[["IV_abn_pre_z", "TermSlope_pre_z", "VRP_1d_z", "R_0_1"]])
+    model = sm.OLS(y, X).fit(cov_type="HC3")
+    print(model.summary())
+    coef_table = model.summary2().tables[1].reset_index()
+    coef_table = coef_table.rename(columns={"index": "Variable"})
+
+    df_reg["Signal_VolBuildup"] = -df_reg["IV_abn_pre_z"]
+    df_reg["Signal_TermSlope"] = -df_reg["TermSlope_pre_z"]
+    df_reg["Signal_Composite"] = 0.6 * df_reg["Signal_VolBuildup"] + 0.4 * df_reg["Signal_TermSlope"]
+    df_reg["ImpliedMove_1d"] = df_reg["EV_1d"]
+    df_reg["RealizedMove_1d"] = df_reg["R_0_1"].abs()
+    df_reg["IVCrush_Impact"] = -df_reg["Crush_1d"] * np.sqrt(1 / 252)
+    df_reg["PnL_proxy"] = df_reg["IVCrush_Impact"] + df_reg["RealizedMove_1d"] - df_reg["ImpliedMove_1d"]
+    df_reg["Signal_quintile"] = pd.qcut(df_reg["Signal_Composite"], 5, labels=False) + 1
+    perf = df_reg.groupby("Signal_quintile")["PnL_proxy"].mean().rename("MeanPnL").to_frame()
+    print(perf)
     df_reg.to_excel(w, sheet_name="regression_data", index=False)
     perf.to_excel(w, sheet_name="signal_perf")
     # <<< NEW: write OLS text summary >>>
