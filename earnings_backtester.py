@@ -23,7 +23,7 @@ SYMBOLS = [
     "NVDA","MSFT","AAPL","META", "AVGO", "GOOGL"
 ]
 
-START_DATE = pd.Timestamp("2023-01-01")
+START_DATE = pd.Timestamp("2020-01-01")
 END_DATE   = pd.Timestamp("2025-11-16")
 
 # Paths
@@ -50,11 +50,11 @@ BACKTEST_CONFIG = {
     "exit_lag": +1,                       # flat after +1
     "min_moneyness": 0.5,                 # filter weird strikes
     "max_moneyness": 1.5,
-    "front_dte_min": 1,                   # at least 1 day to expiry
-    "front_dte_max": 30,                  # front expiry <= 30D
-    "back_dte_min": 60,                   # for calendar, not used in v1
-}
 
+    # NEW
+    "min_dte_for_entry": 5,
+    "max_dte_for_entry": 30,
+}
 
 # ============================================================
 # ===================== DATA STRUCTURES ======================
@@ -277,21 +277,18 @@ class StrategyEarningsATM:
                                  vega_target: float) -> List[Dict[str, Any]]:
         """
         Returns list of target positions (contractID, qty, etc.) for this date/symbol.
-        If no trade, returns empty list (engine keeps current positions but will later
-        close them when we hit exit date).
+        If no trade, returns empty list (engine keeps current positions and will
+        close them on exit date).
         """
-        # Default: keep existing positions unless explicit flat signal around exit.
         targets: List[Dict[str, Any]] = []
 
+        # Only trade on entry dates
         meta = market.get_earnings_meta(symbol, date)
         if meta is None:
-            # If we are not on an entry date, and there are existing earnings
-            # positions, we keep them until exit date; actual flattening will be
-            # handled when date == exit_date of that event.
             return targets
 
         event_day = meta["event_day"]
-        exit_date = meta["exit_date"]
+        # exit_date = meta["exit_date"]  # not needed here, engine handles exit
 
         spot = market.get_spot(symbol, date)
         if spot is None or not np.isfinite(spot):
@@ -301,41 +298,44 @@ class StrategyEarningsATM:
         if chain.empty:
             return targets
 
-        # Filter expiries that are after event_day and within DTE bounds
         cfg = self.config
-        min_mny, max_mny = cfg["min_moneyness"], cfg["max_moneyness"]
-        front_min, front_max = cfg["front_dte_min"], cfg["front_dte_max"]
+        min_mny = cfg["min_moneyness"]
+        max_mny = cfg["max_moneyness"]
+        min_dte = cfg["min_dte_for_entry"]
+        max_dte = cfg["max_dte_for_entry"]
 
         chain = chain.copy()
         chain["dte"] = (chain["expiration"] - date).dt.days
-        chain = chain[chain["dte"] >= 1]
 
-        # Filter by moneyness
+        # Filter by moneyness first
         chain["moneyness"] = chain["strike"] / spot
         chain = chain[(chain["moneyness"] >= min_mny) &
                       (chain["moneyness"] <= max_mny)].copy()
-
         if chain.empty:
             return targets
 
-        # Front expiry: min DTE >= front_min and <= front_max and > event_day
-        after_ev = chain[chain["expiration"] > event_day]
+        # Keep expiries strictly after the earnings event
+        after_ev = chain[chain["expiration"] > event_day].copy()
         if after_ev.empty:
             return targets
-        cand_front = after_ev[(after_ev["dte"] >= front_min) &
-                              (after_ev["dte"] <= front_max)].copy()
-        if cand_front.empty:
-            # fallback: nearest expiry after event_day
-            cand_front = after_ev.copy()
 
-        # Pick ATM strike by abs(moneyness-1)
-        cand_front["abs_mny"] = (cand_front["moneyness"] - 1.0).abs()
-        # For straddle, we need both call and put at that strike & expiry
-        # Start from nearest ATM candidate
-        cand_front = cand_front.sort_values(["expiration", "abs_mny"])
+        # Prefer expiries within [min_dte, max_dte]
+        eligible = after_ev[(after_ev["dte"] >= min_dte) &
+                            (after_ev["dte"] <= max_dte)].copy()
 
+        # If none in that window, fallback = closest expiry after event (smallest DTE)
+        if eligible.empty:
+            eligible = after_ev.sort_values("dte").copy()
+        else:
+            eligible = eligible.copy()
+
+        # Sort by (DTE, |moneyness-1|) to get closest expiry then closest ATM
+        eligible["abs_mny"] = (eligible["moneyness"] - 1.0).abs()
+        eligible = eligible.sort_values(["dte", "abs_mny"])
+
+        # Find first expiry/strike with both call and put
         straddle_contracts = None
-        for _, opt_row in cand_front.iterrows():
+        for _, opt_row in eligible.iterrows():
             expiry = opt_row["expiration"]
             strike = opt_row["strike"]
             sub = chain[(chain["expiration"] == expiry) &
@@ -344,7 +344,6 @@ class StrategyEarningsATM:
             puts  = sub[sub["type"] == "P"]
             if calls.empty or puts.empty:
                 continue
-            # choose first call/put
             call = calls.iloc[0]
             put  = puts.iloc[0]
             straddle_contracts = (call, put)
@@ -355,29 +354,24 @@ class StrategyEarningsATM:
 
         call, put = straddle_contracts
 
-        # Size: short vega_target in total (call + put).
-        # We use current greeks; if vega is degenerate, skip.
+        # --- Sizing by vega target ---
         call_vega = float(call["vega"])
         put_vega  = float(put["vega"])
         tot_vega  = abs(call_vega) + abs(put_vega)
         if tot_vega <= 1e-8:
             return targets
 
-        # Target total vega short (negative) per straddle:
-        # we split evenly across call and put.
-        # So target_vega_call = -0.5 * vega_target; same for put.
-        # Quantity = target_vega / vega_per_contract.
-        vega_per_call = call_vega * self.config["multiplier"]
-        vega_per_put  = put_vega * self.config["multiplier"]
-
+        multiplier = cfg["multiplier"]
+        vega_per_call = call_vega * multiplier
+        vega_per_put  = put_vega * multiplier
         if abs(vega_per_call) <= 1e-8 or abs(vega_per_put) <= 1e-8:
             return targets
 
+        # Target total vega short = -vega_target split evenly between call and put
         target_vega_each = -0.5 * vega_target
         qty_call = target_vega_each / vega_per_call
         qty_put  = target_vega_each / vega_per_put
 
-        # Build target lines (we want these positions in portfolio)
         targets.append({
             "contract_id": str(call["contractID"]),
             "symbol": symbol,
@@ -395,9 +389,7 @@ class StrategyEarningsATM:
             "qty": qty_put,
         })
 
-        # Note: engine will handle closing on exit_date by setting target=0 then.
         return targets
-
 
 # ============================================================
 # ====================== BACKTEST ENGINE =====================
@@ -554,17 +546,21 @@ class Backtester:
             if abs(trade_qty) > 1e-10:
                 spread = option_spread_bps / 1e4
                 if trade_qty > 0:
-                    trade_price = mid_price * (1 + spread)
-                    cash_change = -trade_qty * trade_price * cfg["multiplier"]
+                    trade_price = mid_price * (1 + spread)  # buy at ask
                 else:
-                    trade_price = mid_price * (1 - spread)
-                    cash_change = -trade_qty * trade_price * cfg["multiplier"]
+                    trade_price = mid_price * (1 - spread)  # sell at bid
 
-                # Cash moves, equity will be recomputed as cash + MTM
-                st.cash += cash_change
-                pnl_tc_options += abs(trade_qty) * commission_per_contract
+                # Cash from trade (excluding commission)
+                cash_change = -trade_qty * trade_price * cfg["multiplier"]
 
-                # ---- LOG TRADE WITH GREEKS + IV ----
+                # Commission cost
+                commission = abs(trade_qty) * commission_per_contract
+
+                # Cash moves (including commission), equity will be recomputed as cash + MTM
+                st.cash += cash_change - commission
+                pnl_tc_options += commission
+
+                # Log trade with greeks + IV
                 self.trade_rows.append({
                     "Date": date,
                     "Symbol": symbol,
@@ -639,7 +635,7 @@ class Backtester:
 
                 cash_change = -trade_shares * trade_price
                 st.cash += cash_change
-                # slippage is embedded in cash_change; we do not split it out here
+                # slippage is embedded in cash_change; not split out
 
             # Delta-hedging PnL from holding the stock between days:
             if st.last_spot is not None:
@@ -656,7 +652,6 @@ class Backtester:
                 pnl_delta_hedge = st.stock_pos * dS
 
         # --- PnL decomposition using greeks ---
-        # Option PnL from price changes
         option_pnl = 0.0
         port_gamma_prev = 0.0
         port_vega_prev = 0.0
@@ -670,7 +665,6 @@ class Backtester:
         port_theta_today = 0.0
 
         for pos in st.positions.values():
-            # Need prev_* to compute gamma/vega/theta PnL; if missing, skip
             if pos.prev_price is not None:
                 dP = (pos.last_price - pos.prev_price) * pos.qty * pos.multiplier
                 option_pnl += dP
@@ -738,15 +732,13 @@ class Backtester:
             "MTM_Stock": st.mtm_stock,
             "Spot": spot,
 
-            # PnL
             "DailyPnL": pnl_total,
-            "OptionPnL": option_pnl,          # decomposition only
+            "OptionPnL": option_pnl,
             "PnL_gamma": pnl_gamma,
             "PnL_theta": pnl_theta,
             "PnL_deltaHedge": pnl_delta_hedge,
             "PnL_TC": pnl_tc_options,
 
-            # Cumulative PnL
             "CumPnL": st.cum_pnl,
             "CumPnL_gamma": st.cum_pnl_gamma,
             "CumPnL_vega": st.cum_pnl_vega,
@@ -754,7 +746,6 @@ class Backtester:
             "CumPnL_deltaHedge": st.cum_pnl_delta_hedge,
             "CumPnL_TC": st.cum_pnl_tc,
 
-            # Portfolio greeks (options)
             "Delta": port_delta_today,
             "Gamma": port_gamma_today,
             "Vega": port_vega_today,
@@ -764,7 +755,6 @@ class Backtester:
 
         # update last_spot
         st.last_spot = spot
-
     # ---------- Export ----------
     def _export_results(self):
         if not self.daily_pnl_rows:
@@ -782,11 +772,81 @@ class Backtester:
         config_rows = _flatten_config_dict(self.config)
         df_config = pd.DataFrame(config_rows, columns=["Key", "Value"])
 
+        # Build earnings table (all earnings in period for these symbols)
+        df_earn = self.market.earnings.copy()
+        if df_earn.empty:
+            df_earn = pd.DataFrame(columns=["Symbol", "EventDay"])
+        else:
+            df_earn = df_earn.sort_values(["symbol", "event_day"]).copy()
+            df_earn = df_earn.rename(
+                columns={
+                    "symbol": "Symbol",
+                    "event_day": "EventDay",
+                }
+            )
+
+            # ---------- NEW: Corporate actions table ----------
+        corp_rows = []
+        for sym in self.symbols:
+            path = CORP_DIR / f"{sym}_daily_adjusted.parquet"
+            if not path.exists():
+                continue
+
+            df_c = pd.read_parquet(path)
+            if "date" not in df_c.columns:
+                continue
+
+            df_c["date"] = pd.to_datetime(df_c["date"]).dt.normalize()
+            df_c = df_c[(df_c["date"] >= START_DATE) & (df_c["date"] <= END_DATE)].copy()
+
+            has_div = "dividend_amount" in df_c.columns
+            has_split = "split_coefficient" in df_c.columns
+
+            if not has_div and not has_split:
+                continue
+
+            mask = False
+            if has_div:
+                mask = mask | (df_c["dividend_amount"].fillna(0) != 0)
+            if has_split:
+                mask = mask | (df_c["split_coefficient"].fillna(1) != 1)
+
+            df_c = df_c[mask]
+            if df_c.empty:
+                continue
+
+            cols = ["date"]
+            if has_div:
+                cols.append("dividend_amount")
+            if has_split:
+                cols.append("split_coefficient")
+
+            df_c = df_c[cols].copy()
+            df_c["Symbol"] = sym
+            corp_rows.append(df_c)
+
+        if corp_rows:
+            df_corp = pd.concat(corp_rows, ignore_index=True)
+            df_corp = df_corp.rename(
+                columns={
+                    "date": "Date",
+                    "dividend_amount": "Dividend",
+                    "split_coefficient": "SplitFactor",
+                }
+            )
+            df_corp = df_corp[["Symbol", "Date"] +
+                              [c for c in ["Dividend", "SplitFactor"] if c in df_corp.columns]]
+            df_corp = df_corp.sort_values(["Symbol", "Date"])
+        else:
+            df_corp = pd.DataFrame(columns=["Symbol", "Date", "Dividend", "SplitFactor"])
+        # ---------------------------------------------------
+
         # Build trades table (full universe)
         df_trades_all = pd.DataFrame(self.trade_rows) if self.trade_rows else pd.DataFrame(
             columns=[
                 "Date", "Symbol", "ContractID", "Expiry", "Strike",
-                "Type", "TradeQty", "TradePrice", "TradeNotional", "Spot"
+                "Type", "TradeQty", "TradePrice", "TradeNotional", "Spot",
+                "IV", "Delta", "Gamma", "Vega", "Theta",
             ]
         )
 
@@ -798,7 +858,13 @@ class Backtester:
             # Sheet 2: CONFIG (flattened BACKTEST_CONFIG)
             df_config.to_excel(writer, sheet_name="CONFIG", index=False)
 
-            # Optional global trades sheet (if you also want it aggregated)
+            # Sheet 3: EARNINGS (all earnings in the period)
+            df_earn.to_excel(writer, sheet_name="EARNINGS", index=False)
+
+            # Sheet 4: CORP_ACTIONS (corporate actions in the period)
+            df_corp.to_excel(writer, sheet_name="CORP_ACTIONS", index=False)
+
+            # Optional global trades sheet
             if not df_trades_all.empty:
                 df_trades_all.sort_values(["Date", "Symbol"]).to_excel(
                     writer, sheet_name="ALL_TRADES", index=False
@@ -821,7 +887,6 @@ class Backtester:
                         df_tr_sym.to_excel(writer, sheet_name=sheet_tr, index=False)
 
         print(f"[INFO] Backtest results written to {OUT_PNL_EXCEL}")
-
 # ============================================================
 # ============================= MAIN ==========================
 # ============================================================
