@@ -6,6 +6,15 @@ from typing import Dict, List, Optional, Any
 from tqdm import tqdm
 import numpy as np
 import pandas as pd
+from line_profiler import LineProfiler
+
+# Line-profiler hook: if running with kernprof/line_profiler, a real
+# `profile` symbol will be injected. Otherwise this is a no-op decorator.
+try:
+    profile  # type: ignore[name-defined]
+except NameError:
+    def profile(func):
+        return func
 
 # ============================================================
 # ===================== CONFIG SECTION =======================
@@ -20,7 +29,7 @@ API_KEY = ""  # only needed if you later add fetching here
 # ]
 
 SYMBOLS = [
-    "NVDA","MSFT","AAPL","META", "AVGO", "GOOGL"
+    "NVDA","MSFT","AAPL","META", "AVGO", "GOOGL", "PLTR", "JPM","V",
 ]
 
 START_DATE = pd.Timestamp("2020-01-01")
@@ -31,7 +40,7 @@ CORP_DIR    = pathlib.Path("alpha_corp_actions")   # where *_daily_adjusted.parq
 OPTIONS_DIR = pathlib.Path("alpha_options_raw")    # where <SYM>.parquet live
 EARNINGS_CSV = "earnings.csv"                     # must have: symbol, event_day
 
-OUT_PNL_EXCEL = "earnings_backtest_pnl.xlsx"
+OUT_PNL_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\earnings_backtest_pnl.xlsx"
 
 # Backtest configuration
 BACKTEST_CONFIG = {
@@ -120,7 +129,7 @@ class TickerState:
 class MarketData:
     """
     Loads and provides:
-      - daily adjusted spot
+      - daily split-normalized spot
       - full options chain per (symbol, date)
       - earnings events and entry/exit dates
     """
@@ -129,7 +138,7 @@ class MarketData:
         self.spot: Dict[str, pd.DataFrame] = {}
         self.options: Dict[str, pd.DataFrame] = {}
         self.earnings: pd.DataFrame = pd.DataFrame()
-        self.entry_exit_map: Dict[str, Dict[pd.Timestamp, Dict[str, Any]]] = {}
+        self.entry_exit_map: Dict[pd.Timestamp, Dict[str, Any]] = {}
 
         self._load_spot()
         self._load_options()
@@ -137,18 +146,78 @@ class MarketData:
         self._build_entry_exit_maps()
 
     # ---------- Spot ----------
+    # ---------- Spot ----------
+    @profile
     def _load_spot(self):
+        """
+        Load spot and build a split-only normalization.
+
+        For each symbol:
+          - read AlphaVantage daily adjusted file
+          - build a cumulative split_level from `split_coefficient`
+          - define price_factor[t] = split_level[last] / split_level[t]
+          - define spot[t] = close_raw[t] / price_factor[t]
+
+        This gives a spot series that is continuous across splits and
+        *does not* adjust for dividends. We also store price_factor per date
+        so strikes can be normalized consistently in _load_options.
+        """
         for sym in self.symbols:
             path = CORP_DIR / f"{sym}_daily_adjusted.parquet"
             if not path.exists():
                 print(f"[WARN] Spot file missing for {sym}: {path}")
                 continue
+
             df = pd.read_parquet(path)
+            if "date" not in df.columns:
+                print(f"[WARN] No 'date' column in {path}, skipping {sym}")
+                continue
+
             df["date"] = pd.to_datetime(df["date"]).dt.normalize()
             df = df[(df["date"] >= START_DATE) & (df["date"] <= END_DATE)].copy()
-            df = df.set_index("date").sort_index()
-            self.spot[sym] = df[["adj_close"]].rename(columns={"adj_close": "spot"})
-            print(f"[INFO] Spot loaded for {sym}: {self.spot[sym].shape[0]} days")
+            if df.empty:
+                print(f"[WARN] No spot rows for {sym} in backtest window.")
+                continue
+
+            df = df.sort_values("date").set_index("date")
+
+            # Use raw close if available, otherwise fall back to adj_close.
+            if "close" in df.columns:
+                close_raw = df["close"].astype(float)
+            elif "adj_close" in df.columns:
+                close_raw = df["adj_close"].astype(float)
+            else:
+                raise ValueError(f"{sym}: neither 'close' nor 'adj_close' in {path}")
+
+            # Build split-only series: split_coefficient = split ratio on that date,
+            # 10 for a 10-for-1 split, 1 otherwise. Missing → 1.
+            if "split_coefficient" in df.columns:
+                split_raw = df["split_coefficient"].astype(float)
+                split_raw = split_raw.replace(0.0, np.nan).fillna(1.0)
+            else:
+                split_raw = pd.Series(1.0, index=df.index)
+
+            # Ascending cumulative split level: e.g. 1 → 10 → 40 for 10-for-1 then 4-for-1.
+            split_level = split_raw.cumprod()
+
+            # Normalize prices so that the LAST date has factor = 1.
+            # price_factor[t] = split_level[last] / split_level[t]
+            # Then spot_norm[t] = close_raw[t] / price_factor[t].
+            level_last = float(split_level.iloc[-1])
+            if level_last <= 0:
+                level_last = 1.0
+
+            price_factor = level_last / split_level
+            spot_norm = close_raw / price_factor
+
+            out = pd.DataFrame(
+                {
+                    "spot": spot_norm.astype(float),
+                    "price_factor": price_factor.astype(float),
+                }
+            )
+            self.spot[sym] = out
+            print(f"[INFO] Spot loaded for {sym}: {out.shape[0]} days")
 
     def get_spot(self, symbol: str, date: pd.Timestamp) -> Optional[float]:
         df = self.spot.get(symbol)
@@ -166,20 +235,53 @@ class MarketData:
         return df.index
 
     # ---------- Options ----------
+    @profile
     def _load_options(self):
+        """
+        Load options and attach a split-normalized strike:
+
+          - merge per-symbol `price_factor` on date
+          - define strike_eff = strike_raw / price_factor[date]
+
+        Strategy will use strike_eff for moneyness, so that spot/strike
+        live in the same split-adjusted universe as `spot`.
+        """
         for sym in self.symbols:
             path = OPTIONS_DIR / f"{sym}.parquet"
             if not path.exists():
                 print(f"[WARN] Options file missing for {sym}: {path}")
                 continue
-            df = pd.read_parquet(
-                path
-            )
+
+            df = pd.read_parquet(path)
+
             # normalize columns
+            if "date" not in df.columns or "expiration" not in df.columns:
+                print(f"[WARN] Missing date/expiration in options for {sym}, skipping.")
+                continue
+
             df["date"] = pd.to_datetime(df["date"]).dt.normalize()
             df["expiration"] = pd.to_datetime(df["expiration"]).dt.normalize()
             df["strike"] = df["strike"].astype(float)
             df["type"] = df["type"].astype(str).str.upper().str[0]  # "C"/"P"
+
+            # Restrict to backtest window early
+            df = df[(df["date"] >= START_DATE) & (df["date"] <= END_DATE)].copy()
+            if df.empty:
+                print(f"[WARN] No option rows for {sym} in backtest window.")
+                continue
+
+            # Attach price_factor from spot (split-only normalization).
+            spot_df = self.spot.get(sym)
+            if spot_df is not None and "price_factor" in spot_df.columns:
+                pf = spot_df[["price_factor"]].reset_index()  # index is date
+                pf = pf.rename(columns={"date": "date"})
+                df = df.merge(pf, on="date", how="left")
+            else:
+                # Fallback: no split info, assume factor = 1.
+                df["price_factor"] = 1.0
+
+            df["price_factor"] = df["price_factor"].fillna(1.0).astype(float)
+
             # choose mid price
             if "mark" in df.columns:
                 df["mid"] = df["mark"].astype(float)
@@ -189,10 +291,14 @@ class MarketData:
                 df["mid"] = np.where(
                     np.isfinite(bid) & np.isfinite(ask) & (bid > 0) & (ask > 0),
                     0.5 * (bid + ask),
-                    df.get("last", np.nan).astype(float)
+                    df.get("last", np.nan).astype(float),
                 )
-            df = df[(df["date"] >= START_DATE) & (df["date"] <= END_DATE)].copy()
+
             df = df[df["mid"] > 0].copy()
+
+            # Effective (split-normalized) strike: raw strike divided by price_factor.
+            # This ensures moneyness = strike_eff / spot uses the same split-adjusted scale.
+            df["strike_eff"] = df["strike"] / df["price_factor"]
 
             self.options[sym] = df
             print(f"[INFO] Options loaded for {sym}: {df.shape[0]:,} rows")
@@ -279,6 +385,9 @@ class StrategyEarningsATM:
         Returns list of target positions (contractID, qty, etc.) for this date/symbol.
         If no trade, returns empty list (engine keeps current positions and will
         close them on exit date).
+
+        Key point: moneyness is computed using split-normalized strike
+        (`strike_eff`) divided by split-normalized spot.
         """
         targets: List[Dict[str, Any]] = []
 
@@ -288,7 +397,7 @@ class StrategyEarningsATM:
             return targets
 
         event_day = meta["event_day"]
-        # exit_date = meta["exit_date"]  # not needed here, engine handles exit
+        # exit_date = meta["exit_date"]  # engine handles exit
 
         spot = market.get_spot(symbol, date)
         if spot is None or not np.isfinite(spot):
@@ -307,8 +416,11 @@ class StrategyEarningsATM:
         chain = chain.copy()
         chain["dte"] = (chain["expiration"] - date).dt.days
 
-        # Filter by moneyness first
-        chain["moneyness"] = chain["strike"] / spot
+        # Use split-normalized strike if available; fallback to raw strike.
+        strike_col = "strike_eff" if "strike_eff" in chain.columns else "strike"
+        chain["moneyness"] = chain[strike_col] / spot
+
+        # Filter by moneyness
         chain = chain[(chain["moneyness"] >= min_mny) &
                       (chain["moneyness"] <= max_mny)].copy()
         if chain.empty:
@@ -337,9 +449,9 @@ class StrategyEarningsATM:
         straddle_contracts = None
         for _, opt_row in eligible.iterrows():
             expiry = opt_row["expiration"]
-            strike = opt_row["strike"]
+            strike_raw = opt_row["strike"]  # use raw strike for contract ID matching
             sub = chain[(chain["expiration"] == expiry) &
-                        (chain["strike"] == strike)]
+                        (chain["strike"] == strike_raw)]
             calls = sub[sub["type"] == "C"]
             puts  = sub[sub["type"] == "P"]
             if calls.empty or puts.empty:
@@ -376,7 +488,7 @@ class StrategyEarningsATM:
             "contract_id": str(call["contractID"]),
             "symbol": symbol,
             "expiry": call["expiration"],
-            "strike": float(call["strike"]),
+            "strike": float(call["strike"]),  # raw strike for reporting
             "type": "C",
             "qty": qty_call,
         })
@@ -439,6 +551,7 @@ class Backtester:
         all_dates = sorted(set().union(*[set(idx) for idx in calendars]))
         return pd.DatetimeIndex(all_dates)
 
+    @profile
     def _process_symbol_date(self, symbol: str, date: pd.Timestamp):
         st = self.state[symbol]
         equity_prev = st.equity
@@ -483,11 +596,13 @@ class Backtester:
             # Cannot price, skip PnL / trading for today
             return
 
-        # Build a dict for today's prices/greeks by contract_id
-        todays = {
-            str(row["contractID"]): row
-            for _, row in chain_today.iterrows()
-        }
+        if not chain_today.empty:
+            # Build a fast index by *string* contract id (matches your positions dict keys)
+            chain_today = chain_today.copy()
+            chain_today["cid"] = chain_today["contractID"].astype(str)
+            chain_today_idx = chain_today.set_index("cid")
+        else:
+            chain_today_idx = None
 
         # First, mark previous positions as prev_* for PnL decomposition
         for pos in st.positions.values():
@@ -523,8 +638,14 @@ class Backtester:
             cur_pos = st.positions.get(cid)
             tgt_qty = target_qty.get(cid, cur_pos.qty if cur_pos else 0.0)
 
-            row = todays.get(cid)
-            if row is None:
+            if chain_today_idx is None:
+                # no chain data -> cannot trade / mark
+                continue
+
+            try:
+                row = chain_today_idx.loc[cid]
+            except KeyError:
+                # contract not listed today -> skip
                 continue
 
             mid_price = float(row["mid"])
@@ -661,7 +782,7 @@ class Backtester:
 
         port_delta_today = 0.0
         port_gamma_today = 0.0
-        port_vega_today  = 0.0
+        port_vega_today = 0.0
         port_theta_today = 0.0
 
         for pos in st.positions.values():
@@ -683,7 +804,7 @@ class Backtester:
 
             port_delta_today += pos.delta * pos.qty * pos.multiplier
             port_gamma_today += pos.gamma * pos.qty * pos.multiplier
-            port_vega_today  += pos.vega  * pos.qty * pos.multiplier
+            port_vega_today += pos.vega * pos.qty * pos.multiplier
             port_theta_today += pos.theta * pos.qty * pos.multiplier
 
         dS = 0.0
@@ -698,7 +819,7 @@ class Backtester:
             dIV_eff = 0.0
 
         pnl_gamma = 0.5 * port_gamma_prev * (dS ** 2)
-        pnl_vega  = port_vega_prev * dIV_eff
+        pnl_vega = port_vega_prev * dIV_eff
         pnl_theta = port_theta_prev * dt
 
         # --- Recompute MTM and equity at end-of-day ---
@@ -893,5 +1014,13 @@ class Backtester:
 
 if __name__ == "__main__":
     bt = Backtester(BACKTEST_CONFIG, SYMBOLS)
+    # lp = LineProfiler()
+    # lp.add_function(Backtester._process_symbol_date)
+    # lp.add_function(StrategyEarningsATM.compute_target_positions)
+    #
+    # lp_wrapper = lp(bt.run)
+    # lp_wrapper()
+    #
+    # lp.print_stats()
     bt.run()
 
