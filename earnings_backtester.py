@@ -32,6 +32,10 @@ SYMBOLS = [
     "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
 ]
 
+# SYMBOLS = [
+#     "NVDA","MSFT"
+# ]
+
 START_DATE = pd.Timestamp("2020-01-01")
 END_DATE   = pd.Timestamp("2025-11-16")
 
@@ -40,7 +44,7 @@ CORP_DIR     = pathlib.Path("alpha_corp_actions")   # *_daily_adjusted.parquet
 OPTIONS_DIR  = pathlib.Path("alpha_options_raw")    # <SYM>.parquet
 EARNINGS_CSV = "earnings.csv"                      # columns: symbol, event_day
 
-OUT_PNL_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\earnings_backtest_pnl_noDH.xlsx"
+OUT_PNL_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\Better_handle_Earnings_timing_strangle.xlsx"
 
 BACKTEST_CONFIG = {
     "initial_equity_per_ticker": 100.0,
@@ -51,7 +55,7 @@ BACKTEST_CONFIG = {
     # Strategy selection
     # "straddle" = ATM straddle (your original)
     # "strangle" = OTM strangle with ± strangle_mny_offset moneyness
-    "strategy_type": "straddle",      # or "strangle"
+    "strategy_type": "strangle",      # or "strangle", "straddle"
     "strangle_mny_offset": 0.03,      # 3% OTM for each leg when using strangle
 
     "use_signal": False,              # reserved
@@ -60,11 +64,23 @@ BACKTEST_CONFIG = {
         "stock_spread_bps": 1,
         "commission_per_contract": 0.0,
     },
-    "delta_hedge": False,
+    "delta_hedge": True,
 
-    # Entry/exit lags (currently implemented as T-1, T+1 via mapping)
-    "entry_lag": -1,
-    "exit_lag": +1,
+    # Entry/exit lags in business days relative to event_day, per timing
+    # BMO: enter previous day, exit event day  -> (-1, 0)
+    # AMC: enter event day,   exit next day   -> (0, +1)
+    "entry_lag": {
+        "BMO": -1,
+        "AMC": 0,
+        "DURING": 0,
+        "UNKNOWN": 0,
+    },
+    "exit_lag": {
+        "BMO": 0,
+        "AMC": 1,
+        "DURING": 1,
+        "UNKNOWN": 1,
+    },
 
     "min_moneyness": 0.5,
     "max_moneyness": 1.5,
@@ -155,12 +171,10 @@ class MarketData:
         self.spot: Dict[str, pd.DataFrame] = {}
         self.options: Dict[str, pd.DataFrame] = {}
         self.earnings: pd.DataFrame = pd.DataFrame()
-        self.entry_exit_map: Dict[str, Dict[pd.Timestamp, Dict[str, Any]]] = {}
 
         self._load_spot()
         self._load_options()
         self._load_earnings()
-        self._build_entry_exit_maps()
 
     # ---------- Spot ----------
     @profile
@@ -295,49 +309,22 @@ class MarketData:
             return
 
         df = pd.read_csv(EARNINGS_CSV)
+
         df["symbol"] = df["symbol"].astype(str).str.upper()
         df["event_day"] = pd.to_datetime(df["event_day"]).dt.normalize()
+
+        # If timing exists in CSV (BMO/AMC/...), keep it; else default to UNKNOWN
+        if "timing" in df.columns:
+            df["timing"] = df["timing"].astype(str).str.upper()
+        else:
+            df["timing"] = "UNKNOWN"
+
         df = df[df["symbol"].isin(self.symbols)].copy()
         df = df[(df["event_day"] >= START_DATE) & (df["event_day"] <= END_DATE)].copy()
         df = df.drop_duplicates(subset=["symbol", "event_day"]).reset_index(drop=True)
+
         self.earnings = df
         print(f"[INFO] Earnings loaded: {len(df)} events")
-
-    def _build_entry_exit_maps(self):
-        """
-        For each symbol, build:
-          entry_date -> {"event_day": ..., "exit_date": ...}
-        using ticker's spot calendar (T-1 / T+1 convention).
-        """
-        for sym in self.symbols:
-            cal = self.get_spot_calendar(sym)
-            if len(cal) == 0:
-                continue
-
-            evs = self.earnings[self.earnings["symbol"] == sym]
-            mapping: Dict[pd.Timestamp, Dict[str, Any]] = {}
-
-            for _, row in evs.iterrows():
-                ev_day = row["event_day"]
-                idx = cal.searchsorted(ev_day)
-
-                if idx == 0:
-                    continue
-                entry = cal[idx - 1]
-
-                if idx + 1 >= len(cal):
-                    exit_ = None
-                else:
-                    exit_ = cal[idx + 1]
-
-                mapping[entry] = {
-                    "event_day": ev_day,
-                    "exit_date": exit_,
-                }
-            self.entry_exit_map[sym] = mapping
-
-    def get_earnings_meta(self, symbol: str, date: pd.Timestamp) -> Optional[Dict[str, Any]]:
-        return self.entry_exit_map.get(symbol, {}).get(date)
 
 
 # ============================================================
@@ -358,6 +345,77 @@ class StrategyEarningsATM:
     def __init__(self, config: dict):
         self.config = config
 
+    def build_entry_exit_map(self, market: MarketData) -> Dict[str, Dict[pd.Timestamp, Dict[str, Any]]]:
+        """
+        Build per-symbol entry/exit windows for earnings trades.
+
+        Uses:
+          - market.earnings: columns [symbol, event_day, timing, ...]
+          - market.get_spot_calendar(symbol)
+          - self.config['entry_lag'] / ['exit_lag']: dicts by timing
+
+        Returns:
+          { symbol -> { entry_date -> {'event_day', 'exit_date', 'timing'} } }
+        """
+
+        # Default lags if config doesn't provide full mapping
+        default_entry_lag = {"BMO": -1, "AMC": 0, "DURING": 0, "UNKNOWN": 0}
+        default_exit_lag  = {"BMO": 0,  "AMC": 1, "DURING": 1, "UNKNOWN": 1}
+
+        cfg_entry = self.config.get("entry_lag", {})
+        cfg_exit  = self.config.get("exit_lag", {})
+
+        # Merge defaults with config (config overrides)
+        entry_lag_cfg = {**default_entry_lag, **cfg_entry}
+        exit_lag_cfg  = {**default_exit_lag,  **cfg_exit}
+
+        mapping_global: Dict[str, Dict[pd.Timestamp, Dict[str, Any]]] = {}
+
+        for sym in market.symbols:
+            cal = market.get_spot_calendar(sym)
+            if len(cal) == 0:
+                continue
+
+            evs = market.earnings[market.earnings["symbol"] == sym]
+            if evs.empty:
+                continue
+
+            mapping_sym: Dict[pd.Timestamp, Dict[str, Any]] = {}
+
+            for _, row in evs.iterrows():
+                ev_day = row["event_day"]
+                timing = row.get("timing", "UNKNOWN")
+
+                # anchor index: first trading day >= event_day
+                anchor_idx = cal.searchsorted(ev_day)
+                if anchor_idx >= len(cal):
+                    # event after last available trading day
+                    continue
+
+                entry_off = entry_lag_cfg.get(timing, entry_lag_cfg["UNKNOWN"])
+                exit_off  = exit_lag_cfg.get(timing,  exit_lag_cfg["UNKNOWN"])
+
+                entry_idx = anchor_idx + entry_off
+                exit_idx  = anchor_idx + exit_off
+
+                # skip if entry date out of calendar
+                if entry_idx < 0 or entry_idx >= len(cal):
+                    continue
+
+                entry_date = cal[entry_idx]
+                exit_date = cal[exit_idx] if 0 <= exit_idx < len(cal) else None
+
+                mapping_sym[entry_date] = {
+                    "event_day": ev_day,
+                    "exit_date": exit_date,
+                    "timing": timing,
+                }
+
+            mapping_global[sym] = mapping_sym
+
+        self.entry_exit_map = mapping_global
+        return mapping_global
+
     def compute_target_positions(
         self,
         date: pd.Timestamp,
@@ -371,7 +429,7 @@ class StrategyEarningsATM:
         strategy_type = cfg.get("strategy_type", "straddle")
         targets: List[Dict[str, Any]] = []
 
-        meta = market.get_earnings_meta(symbol, date)
+        meta = self.entry_exit_map.get(symbol, {}).get(date)
         if meta is None:
             return targets
 
@@ -540,6 +598,8 @@ class Backtester:
         self.symbols = symbols
         self.market = MarketData(symbols)
         self.strategy = StrategyEarningsATM(config)
+        self.strategy.build_entry_exit_map(self.market)
+
 
         self.daily_pnl_rows: List[Dict[str, Any]] = []
         self.trade_rows: List[Dict[str, Any]] = []
@@ -594,9 +654,10 @@ class Backtester:
         )
 
         # Exit logic: flat on any event exit date
+        mapping_sym = self.strategy.entry_exit_map.get(symbol, {})
         need_flat = any(
             meta_ev.get("exit_date") == date
-            for meta_ev in self.market.entry_exit_map.get(symbol, {}).values()
+            for meta_ev in mapping_sym.values()
         )
         if need_flat:
             target_lines = []
@@ -873,6 +934,7 @@ class Backtester:
 
         df = pd.DataFrame(self.daily_pnl_rows)
         df = df.sort_values(["Date", "Symbol"]).reset_index(drop=True)
+        df = df.bfill()
 
         pivot_equity = df.pivot(index="Date", columns="Symbol", values="Equity")
         pivot_equity["PortfolioEquity"] = pivot_equity.sum(axis=1)
@@ -889,59 +951,94 @@ class Backtester:
                 columns={"symbol": "Symbol", "event_day": "EventDay"}
             )
 
-        # --- Corporate actions table (as in your original) ---
-        corp_rows = []
-        for sym in self.symbols:
-            path = CORP_DIR / f"{sym}_daily_adjusted.parquet"
-            if not path.exists():
-                continue
+        # --- Corporate actions table (reworked) ---
+        def _build_corp_actions_df() -> pd.DataFrame:
+            corp_rows = []
 
-            df_c = pd.read_parquet(path)
-            if "date" not in df_c.columns:
-                continue
+            for sym in self.symbols:
+                path = CORP_DIR / f"{sym}_daily_adjusted.parquet"
+                if not path.exists():
+                    print(f"[CORP] Missing daily_adjusted file for {sym}: {path}")
+                    continue
 
-            df_c["date"] = pd.to_datetime(df_c["date"]).dt.normalize()
-            df_c = df_c[(df_c["date"] >= START_DATE) & (df_c["date"] <= END_DATE)].copy()
+                df_c = pd.read_parquet(path)
 
-            has_div = "dividend_amount" in df_c.columns
-            has_split = "split_coefficient" in df_c.columns
-            if not has_div and not has_split:
-                continue
+                if "date" not in df_c.columns:
+                    print(f"[CORP] No 'date' column in {path}, skipping {sym}")
+                    continue
 
-            mask = False
-            if has_div:
-                mask = mask | (df_c["dividend_amount"].fillna(0) != 0)
-            if has_split:
-                mask = mask | (df_c["split_coefficient"].fillna(1) != 1)
+                df_c["date"] = pd.to_datetime(df_c["date"]).dt.normalize()
+                df_c = df_c[(df_c["date"] >= START_DATE) &
+                            (df_c["date"] <= END_DATE)].copy()
+                if df_c.empty:
+                    print(f"[CORP] No rows for {sym} in backtest window.")
+                    continue
 
-            df_c = df_c[mask]
-            if df_c.empty:
-                continue
+                # Try to detect dividend / split columns in a flexible way
+                lower_cols = {c.lower(): c for c in df_c.columns}
 
-            cols = ["date"]
-            if has_div:
-                cols.append("dividend_amount")
-            if has_split:
-                cols.append("split_coefficient")
+                div_col = None
+                split_col = None
 
-            df_c = df_c[cols].copy()
-            df_c["Symbol"] = sym
-            corp_rows.append(df_c)
+                for lc, orig in lower_cols.items():
+                    if "dividend" in lc:
+                        div_col = orig
+                    if "split" in lc:
+                        split_col = orig
 
-        if corp_rows:
+                if div_col is None and split_col is None:
+                    print(f"[CORP] No dividend/split columns for {sym}. "
+                          f"Columns: {list(df_c.columns)}")
+                    continue
+
+                # Build mask of rows where something actually happened
+                mask = False
+                if div_col is not None:
+                    mask = (df_c[div_col].fillna(0).astype(float) != 0)
+                if split_col is not None:
+                    # split factor != 1 means actual split
+                    split_mask = (df_c[split_col].fillna(1).astype(float) != 1)
+                    mask = mask | split_mask if isinstance(mask, pd.Series) else split_mask
+
+                df_c = df_c[mask]
+                if df_c.empty:
+                    print(f"[CORP] No non-zero dividends/splits for {sym} in window.")
+                    continue
+
+                cols = ["date"]
+                if div_col is not None:
+                    cols.append(div_col)
+                if split_col is not None:
+                    cols.append(split_col)
+
+                df_c = df_c[cols].copy()
+                df_c["Symbol"] = sym
+
+                # Normalize column names
+                rename_map = {"date": "Date"}
+                if div_col is not None:
+                    rename_map[div_col] = "Dividend"
+                if split_col is not None:
+                    rename_map[split_col] = "SplitFactor"
+
+                df_c = df_c.rename(columns=rename_map)
+                corp_rows.append(df_c)
+
+            if not corp_rows:
+                print("[CORP] No corporate actions found for any symbol.")
+                return pd.DataFrame(columns=["Symbol", "Date", "Dividend", "SplitFactor"])
+
             df_corp = pd.concat(corp_rows, ignore_index=True)
-            df_corp = df_corp.rename(
-                columns={
-                    "date": "Date",
-                    "dividend_amount": "Dividend",
-                    "split_coefficient": "SplitFactor",
-                }
-            )
-            df_corp = df_corp[["Symbol", "Date"] +
-                              [c for c in ["Dividend", "SplitFactor"] if c in df_corp.columns]]
+            # Ensure standard column order
+            for col in ["Dividend", "SplitFactor"]:
+                if col not in df_corp.columns:
+                    df_corp[col] = np.nan
+
+            df_corp = df_corp[["Symbol", "Date", "Dividend", "SplitFactor"]]
             df_corp = df_corp.sort_values(["Symbol", "Date"])
-        else:
-            df_corp = pd.DataFrame(columns=["Symbol", "Date", "Dividend", "SplitFactor"])
+            return df_corp
+
+        df_corp = _build_corp_actions_df()
 
         df_trades_all = (
             pd.DataFrame(self.trade_rows)
@@ -957,16 +1054,19 @@ class Backtester:
 
         # --- Event-level PnL sheet (entry->exit window) ---
         event_pnl_rows = []
-        for sym, mapping in self.market.entry_exit_map.items():
+        for sym, mapping in self.strategy.entry_exit_map.items():
             for entry_date, meta in mapping.items():
                 exit_date = meta["exit_date"]
                 event_day = meta["event_day"]
+                timing = meta.get("timing", "UNKNOWN")
+
                 if exit_date is None:
                     continue
+
                 mask = (
-                    (df["Symbol"] == sym) &
-                    (df["Date"] >= entry_date) &
-                    (df["Date"] <= exit_date)
+                        (df["Symbol"] == sym) &
+                        (df["Date"] >= entry_date) &
+                        (df["Date"] <= exit_date)
                 )
                 df_window = df[mask]
                 if df_window.empty:
@@ -977,6 +1077,7 @@ class Backtester:
                     "EntryDate": entry_date,
                     "EventDay": event_day,
                     "ExitDate": exit_date,
+                    "Timing": timing,
                     "EventWindowPnL": df_window["DailyPnL"].sum(),
                     "EventWindowPnL_vega": df_window["PnL_vega"].sum(),
                     "EventWindowPnL_gamma": df_window["PnL_gamma"].sum(),
@@ -990,12 +1091,84 @@ class Backtester:
             if event_pnl_rows
             else pd.DataFrame(
                 columns=[
-                    "Symbol", "EntryDate", "EventDay", "ExitDate",
+                    "Symbol", "EntryDate", "EventDay", "ExitDate", "Timing",
                     "EventWindowPnL", "EventWindowPnL_vega", "EventWindowPnL_gamma",
                     "EventWindowPnL_theta", "EventWindowPnL_deltaHedge", "EventWindowPnL_TC",
                 ]
             )
         )
+
+        # --- Per-symbol performance stats (EVENT_STATS) ---
+        if df_event_pnl.empty:
+            df_event_stats = pd.DataFrame(
+                columns=[
+                    "Symbol",
+                    "N_events",
+                    "Mean_EventPnL",
+                    "Std_EventPnL",
+                    "HitRatio",
+                    "Best_EventPnL",
+                    "Worst_EventPnL",
+                    "BMO_N",
+                    "BMO_Mean_EventPnL",
+                    "AMC_N",
+                    "AMC_Mean_EventPnL",
+                ]
+            )
+        else:
+            # base aggregates across all events
+            base = (
+                df_event_pnl
+                .groupby("Symbol")["EventWindowPnL"]
+                .agg(
+                    N_events="count",
+                    Mean_EventPnL="mean",
+                    Std_EventPnL="std",
+                    Best_EventPnL="max",
+                    Worst_EventPnL="min",
+                )
+            )
+
+            # hit ratio (fraction of events with positive pnl)
+            hit = (
+                df_event_pnl.assign(Positive=df_event_pnl["EventWindowPnL"] > 0)
+                .groupby("Symbol")["Positive"]
+                .mean()
+                .rename("HitRatio")
+            )
+
+            # BMO stats
+            bmo = (
+                df_event_pnl[df_event_pnl["Timing"] == "BMO"]
+                .groupby("Symbol")["EventWindowPnL"]
+                .agg(
+                    BMO_N="count",
+                    BMO_Mean_EventPnL="mean",
+                )
+            )
+
+            # AMC stats
+            amc = (
+                df_event_pnl[df_event_pnl["Timing"] == "AMC"]
+                .groupby("Symbol")["EventWindowPnL"]
+                .agg(
+                    AMC_N="count",
+                    AMC_Mean_EventPnL="mean",
+                )
+            )
+
+            df_event_stats = (
+                base
+                .join(hit, how="left")
+                .join(bmo, how="left")
+                .join(amc, how="left")
+                .reset_index()  # Symbol back as a column
+            )
+
+            # for symbols without BMO/AMC, counts = 0
+            for col in ["BMO_N", "AMC_N"]:
+                if col in df_event_stats.columns:
+                    df_event_stats[col] = df_event_stats[col].fillna(0).astype(int)
 
         with pd.ExcelWriter(OUT_PNL_EXCEL, engine="xlsxwriter") as writer:
             # 1) PORTFOLIO
@@ -1004,6 +1177,9 @@ class Backtester:
 
             # 2) EVENT_PNL (right after portfolio)
             df_event_pnl.to_excel(writer, sheet_name="EVENT_PNL", index=False)
+
+            # 2b) EVENT_STATS (per-name summary)
+            df_event_stats.to_excel(writer, sheet_name="EVENT_STATS", index=False)
 
             # 3) CONFIG
             df_config.to_excel(writer, sheet_name="CONFIG", index=False)

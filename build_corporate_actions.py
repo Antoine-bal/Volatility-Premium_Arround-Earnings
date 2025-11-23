@@ -5,7 +5,11 @@ import requests
 import pandas as pd
 
 # ================== CONFIG ==================
-API_KEY = ""  # <-- put your Alpha Vantage key here
+import os
+from dotenv import load_dotenv
+
+load_dotenv()
+API_KEY = os.getenv('ALPHA_KEY')
 BASE_URL = "https://www.alphavantage.co/query"
 
 SYMBOLS = [

@@ -4,8 +4,10 @@ import pathlib
 import requests
 import pandas as pd
 import datetime
-
-API_KEY = ""   # <-- replace
+import os
+from dotenv import load_dotenv
+load_dotenv()
+API_KEY = os.getenv('ALPHA_KEY')
 BASE_URL = "https://www.alphavantage.co/query"
 
 # ------------------------------------------
@@ -13,16 +15,12 @@ BASE_URL = "https://www.alphavantage.co/query"
 # ------------------------------------------
 START_DATE = "2020-01-01"
 END_DATE   = "2025-11-16"   # or pd.Timestamp.today().strftime("%Y-%m-%d")
-# SYMBOLS = [
-#     "AAPL", "MSFT", "NVDA",  # extend with your universe
-# ]
-
 SYMBOLS = [
-   "TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
+    "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
     "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
-    "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
+    "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT","QQQ","SPY"
 ]
-#"BRK.B",
+
 OUT_DIR = pathlib.Path("alpha_options_raw")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
