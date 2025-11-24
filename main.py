@@ -127,15 +127,15 @@ CACHE_DIR = "cache_iv"
 OUT_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\earnings_iv_analysis.xlsx"
 os.makedirs(CACHE_DIR, exist_ok=True)
 
-# UNIVERSE = [
-#     "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
-#     "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
-#     "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
-# ]
-
 UNIVERSE = [
-    "MSFT","AAPL", "NVDA","META", "AVGO","GOOGL"
+    "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
+    "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
+    "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
 ]
+
+# UNIVERSE = [
+#     "MSFT"
+# ]
 
 STUDY_START = pd.Timestamp("2020-01-01")
 STUDY_END   = pd.Timestamp("2025-11-14")
@@ -460,75 +460,126 @@ def get_options_with_iv_local(
 
 
 # ========= Build 3-case panels for one ticker =========
-def build_atm_panels_for_ticker(opt_df, earn_tkr, pre, post,
-                                base_pre_mat_days, baseline_pre_td,
-                                baseline_post_td, max_anchor_lag_days):
-    if opt_df.empty or earn_tkr.empty: return {1:pd.DataFrame(),2:pd.DataFrame(),3:pd.DataFrame()}
+def build_atm_panels_for_ticker(
+    opt_df, earn_tkr, pre, post,
+    base_pre_mat_days, baseline_pre_td, baseline_post_td, max_anchor_lag_days
+):
+    """
+    3 term cases × 3 moneyness tracks:
+      MnyTrackID: 0=ATM, 1=+EV move, 2=−EV move
+    """
+    if opt_df.empty or earn_tkr.empty:
+        return {1: pd.DataFrame(), 2: pd.DataFrame(), 3: pd.DataFrame()}
     df = opt_df.copy()
     df["date"] = pd.to_datetime(df["date"]).dt.normalize()
     df["expiry"] = pd.to_datetime(df["expiry"]).dt.normalize()
     trading_days = pd.DatetimeIndex(sorted(df["date"].unique()))
-    if len(trading_days)==0: return {1:pd.DataFrame(),2:pd.DataFrame(),3:pd.DataFrame()}
-    panels = {1:[],2:[],3:[]}
-    for _,ev in earn_tkr.iterrows():
-        symbol = ev["symbol"]; event_day = pd.to_datetime(ev["event_day"]).normalize()
+    if len(trading_days) == 0:
+        return {1: pd.DataFrame(), 2: pd.DataFrame(), 3: pd.DataFrame()}
+    panels = {1: [], 2: [], 3: []}
+
+    for _, ev in earn_tkr.iterrows():
+        symbol = ev["symbol"]
+        event_day = pd.to_datetime(ev["event_day"]).normalize()
         idx = trading_days.searchsorted(event_day)
-        cand = [i for i in [idx,idx-1,idx+1] if 0<=i<len(trading_days)]
-        if not cand: continue
-        anchor = min((trading_days[i] for i in cand), key=lambda d: abs((d-event_day).days))
-        if abs((anchor-event_day).days)>max_anchor_lag_days: continue
-        anchor_idx = int(np.where(trading_days==anchor)[0][0])
-        pre_idx = max(0,anchor_idx-pre); pre_date = trading_days[pre_idx]
-        expiries_pre = sorted(df.loc[df["date"]==pre_date,"expiry"].unique())
-        if not expiries_pre: continue
-        future_exps = [e for e in expiries_pre if e>event_day]
-        if not future_exps: continue
-        exp1 = next((e for e in future_exps if e >= (event_day+BDay(6)).normalize()),None)
-        exp2 = next((e for e in future_exps if (e-event_day).days>=30),None)
-        exp3 = next((e for e in future_exps if (e-event_day).days>=90),None)
-        expiry_by_case = {1:exp1,2:exp2,3:exp3}
-        if all(v is None for v in expiry_by_case.values()): continue
-        for case in [1,2,3]:
+        cand = [i for i in [idx, idx - 1, idx + 1] if 0 <= i < len(trading_days)]
+        if not cand:
+            continue
+        anchor = min((trading_days[i] for i in cand), key=lambda d: abs((d - event_day).days))
+        if abs((anchor - event_day).days) > max_anchor_lag_days:
+            continue
+        anchor_idx = int(np.where(trading_days == anchor)[0][0])
+        pre_idx = max(0, anchor_idx - pre)
+        pre_date = trading_days[pre_idx]
+
+        expiries_pre = sorted(df.loc[df["date"] == pre_date, "expiry"].unique())
+        if not expiries_pre:
+            continue
+        future_exps = [e for e in expiries_pre if e > event_day]
+        if not future_exps:
+            continue
+        exp1 = next((e for e in future_exps if e >= (event_day + BDay(6)).normalize()), None)
+        exp2 = next((e for e in future_exps if (e - event_day).days >= 30), None)
+        exp3 = next((e for e in future_exps if (e - event_day).days >= 90), None)
+        expiry_by_case = {1: exp1, 2: exp2, 3: exp3}
+        if all(v is None for v in expiry_by_case.values()):
+            continue
+
+        # baseline IV (ATM only, around anchor)
+        ivs = []
+        b_left = max(0, anchor_idx - baseline_pre_td)
+        b_right = max(0, anchor_idx - baseline_post_td)
+        for j in range(b_left, b_right + 1):
+            dd = trading_days[j]
+            sub = df[df["date"] == dd]
+            if sub.empty:
+                continue
+            row = pick_atm_row(sub)
+            if row is None or not np.isfinite(row["iv"]):
+                continue
+            ivs.append(float(row["iv"]))
+        baseline_iv = float(np.mean(ivs)) if ivs else np.nan
+
+        for case in [1, 2, 3]:
             target = expiry_by_case[case]
-            if target is None: continue
-            b_left,b_right = max(0,anchor_idx-baseline_pre_td),max(0,anchor_idx-baseline_post_td)
-            baseline_iv = np.nan
-            if b_right>b_left:
-                ivs = []
-                for d in trading_days[b_left:b_right]:
-                    row = pick_atm_row(df[(df["date"]==d)&(df["expiry"]==target)])
-                    if row is not None and np.isfinite(row["iv"]): ivs.append(float(row["iv"]))
-                if ivs: baseline_iv = float(np.mean(ivs))
-            w_left,w_right = max(0,anchor_idx-pre),min(len(trading_days)-1,anchor_idx+post)
+            if target is None:
+                continue
+            w_left = max(0, anchor_idx - pre)
+            w_right = min(len(trading_days) - 1, anchor_idx + post)
             for i in range(w_left, w_right + 1):
                 d = trading_days[i]
-                row = pick_atm_row(df[(df["date"] == d) & (df["expiry"] == target)])
-                if row is None or not np.isfinite(row["iv"]):
+                sub = df[(df["date"] == d) & (df["expiry"] == target)]
+                if sub.empty:
                     continue
+                if "moneyness" not in sub.columns:
+                    sub = sub.assign(moneyness=sub["strike"] / sub["spot"])
+                row_atm = pick_atm_row(sub)
+                if row_atm is None or not np.isfinite(row_atm["iv"]):
+                    continue
+                iv_atm = float(row_atm["iv"])
+                spot_val = float(row_atm["spot"])
+                EV_1d = iv_atm * np.sqrt(1.0 / 252.0)
+                mny_up, mny_dn = float(np.exp(EV_1d)), float(np.exp(-EV_1d))
 
-                iv_val = float(row["iv"])
+                def _pick(sub_df, target_mny):
+                    tmp = sub_df.copy()
+                    tmp["abs_mny_target"] = (tmp["moneyness"] - target_mny).abs()
+                    return tmp.loc[tmp["abs_mny_target"].idxmin()]
+
+                row_up = _pick(sub, mny_up)
+                row_dn = _pick(sub, mny_dn)
                 rel = i - anchor_idx
+                rows_tracks = [(0, row_atm), (1, row_up), (2, row_dn)]
 
-                panels[case].append({
-                    "symbol": symbol,
-                    "event_day": event_day,
-                    "case": case,
-                    "target_expiry": target,
-                    "date": d,
-                    "rel": rel,
-                    "iv": iv_val,
-                    "baseline_IV": baseline_iv,
-                    "abn_IV": iv_val - baseline_iv if np.isfinite(baseline_iv) else np.nan,
-                    # <<< NEW FIELDS >>>
-                    "spot": float(row["spot"]),
-                    "strike": float(row["strike"]),
-                    "moneyness": float(row["moneyness"]),
-                    "is_call": bool(row["is_call"]),
-                })
-    for c in [1,2,3]:
-        panels[c] = (pd.DataFrame(panels[c])
-                     .sort_values(["symbol","event_day","date","rel"])
-                     .reset_index(drop=True)) if panels[c] else pd.DataFrame()
+                for mny_id, row in rows_tracks:
+                    iv_val = float(row["iv"])
+                    panels[case].append(
+                        dict(
+                            symbol=symbol,
+                            event_day=event_day,
+                            case=case,
+                            MnyTrackID=int(mny_id),
+                            target_expiry=target,
+                            date=d,
+                            rel=rel,
+                            iv=iv_val,
+                            baseline_IV=baseline_iv,
+                            abn_IV=iv_val - baseline_iv if np.isfinite(baseline_iv) else np.nan,
+                            spot=float(row["spot"]),
+                            strike=float(row["strike"]),
+                            moneyness=float(row["moneyness"]),
+                            is_call=bool(row["is_call"]),
+                        )
+                    )
+
+    for c in [1, 2, 3]:
+        panels[c] = (
+            pd.DataFrame(panels[c])
+            .sort_values(["symbol", "event_day", "case", "MnyTrackID", "date", "rel"])
+            .reset_index(drop=True)
+            if panels[c]
+            else pd.DataFrame()
+        )
     return panels
 
 def build_opt_and_panels_for_ticker(tkr, earn_all, close_long,
@@ -549,30 +600,34 @@ def build_opt_and_panels_for_ticker(tkr, earn_all, close_long,
     return (opt_df if keep_opt_data_in_ram else pd.DataFrame()), panels
 
 # ========= Load spot & earnings =========
+# ==== Load spot & earnings (BMO/AMC-aware) ====
 close_long = load_spot_close_long(SPOT_CSV)
 spot_min = close_long.index.get_level_values("date").min()
 spot_max = close_long.index.get_level_values("date").max()
-
 END_DATE = min(STUDY_END.normalize(), spot_max)
 START_DATE = max(STUDY_START.normalize(), spot_min)
-
-print(f"Study window: {START_DATE.date()} to {END_DATE.date()} "
-      f"(spot range: {spot_min.date()}–{spot_max.date()})")
+print(f"Study window: {START_DATE.date()} to {END_DATE.date()} ({spot_min.date()}–{spot_max.date()})")
 
 earn = pd.read_csv(EARNINGS_CSV)
 earn["symbol"] = earn["symbol"].astype(str).str.upper()
 earn["event_day"] = pd.to_datetime(earn["event_day"]).dt.normalize()
-earn = (earn[earn["symbol"].isin(UNIVERSE) &
-             (earn["event_day"]>=START_DATE) &
-             (earn["event_day"]<=END_DATE)]
-        .drop_duplicates(subset=["symbol","event_day"])
-        .reset_index(drop=True))
+earn["timing"] = earn.get("timing", "UNKNOWN")
+earn["timing"] = earn["timing"].astype(str).str.upper()
+earn = (
+    earn[earn["symbol"].isin(UNIVERSE) &
+         (earn["event_day"] >= START_DATE) &
+         (earn["event_day"] <= END_DATE)]
+    .drop_duplicates(subset=["symbol", "event_day"])
+    .reset_index(drop=True)
+)
 print(f"Earnings events: {len(earn)}")
 
 idx = close_long.index
-mask = idx.get_level_values("symbol").isin(UNIVERSE) & \
-       (idx.get_level_values("date") >= START_DATE) & \
-       (idx.get_level_values("date") <= END_DATE)
+mask = (
+    idx.get_level_values("symbol").isin(UNIVERSE) &
+    (idx.get_level_values("date") >= START_DATE) &
+    (idx.get_level_values("date") <= END_DATE)
+)
 close_long = close_long[mask].sort_index()
 print("close_long:", close_long.shape)
 
@@ -589,83 +644,240 @@ for tkr in UNIVERSE:
     OPT_DATA[tkr], PANELS[tkr] = opt_df_out, panels_tkr
 print("\nAll tickers processed.")
 
-# ========= panel_clean =========
+# ==== panel_clean (now with MnyTrackID + timing) ====
 clean_rows = []
-for symbol,cases in PANELS.items():
-    for case_id,df_case in cases.items():
-        if df_case is None or df_case.empty: continue
-        df = df_case.copy()
-        df["Symbol"] = df["symbol"].astype(str)
-        df["EventDate"] = pd.to_datetime(df["event_day"]).dt.normalize()
-        df["CaseID"] = int(case_id)
-        df["MaturityDate"] = pd.to_datetime(df["target_expiry"]).dt.normalize()
-        df["ObsDate"] = pd.to_datetime(df["date"]).dt.normalize()
-        df["t_rel"] = df["rel"].astype(int)
-        df["IV"] = df["iv"]; df["IV_base"] = df["baseline_IV"]; df["IV_abn"] = df["abn_IV"]
-        df["TTM_yrs"] = (df["MaturityDate"]-df["ObsDate"]).dt.days/365.0
-        clean_rows.append(df[["Symbol","EventDate","CaseID","MaturityDate","ObsDate",
-                              "t_rel","TTM_yrs","IV","IV_base","IV_abn"]])
-panel_clean = (pd.concat(clean_rows,ignore_index=True)
-               .sort_values(["Symbol","EventDate","CaseID","ObsDate","t_rel"])
-               .reset_index(drop=True)) if clean_rows else \
-              pd.DataFrame(columns=["Symbol","EventDate","CaseID","MaturityDate","ObsDate",
-                                    "t_rel","TTM_yrs","IV","IV_base","IV_abn"])
+for symbol, cases in PANELS.items():
+    for case_id, df_case in cases.items():
+        if df_case is None or df_case.empty:
+            continue
+        df_case["TTM_yrs"] = (df_case["target_expiry"] - df_case["date"]).dt.days / 365.0
+        df = df_case.rename(
+            columns={
+                "symbol": "Symbol",
+                "event_day": "EventDate",
+                "case": "CaseID",
+                "target_expiry": "MaturityDate",
+                "date": "ObsDate",
+                "rel": "t_rel",
+                "iv": "IV",
+                "baseline_IV": "IV_base",
+                "abn_IV": "IV_abn",
+            }
+        )
+        if "MnyTrackID" not in df.columns:
+            df["MnyTrackID"] = 0
+        clean_rows.append(
+            df[
+                [
+                    "Symbol",
+                    "EventDate",
+                    "CaseID",
+                    "MnyTrackID",
+                    "MaturityDate",
+                    "ObsDate",
+                    "t_rel",
+                    "TTM_yrs",
+                    "IV",
+                    "IV_base",
+                    "IV_abn",
+                ]
+            ]
+        )
+
+panel_clean = (
+    pd.concat(clean_rows, ignore_index=True)
+    .sort_values(["Symbol", "EventDate", "CaseID", "MnyTrackID", "ObsDate", "t_rel"])
+    .reset_index(drop=True)
+    if clean_rows
+    else pd.DataFrame(
+        columns=[
+            "Symbol",
+            "EventDate",
+            "CaseID",
+            "MnyTrackID",
+            "MaturityDate",
+            "ObsDate",
+            "t_rel",
+            "TTM_yrs",
+            "IV",
+            "IV_base",
+            "IV_abn",
+        ]
+    )
+)
 print("panel_clean:", panel_clean.shape)
 
-# ========= event_features =========
-spot_df = pd.read_csv(SPOT_CSV,parse_dates=["date"])
+earn_for_merge = earn[["symbol", "event_day", "timing"]].copy()
+earn_for_merge["symbol"] = earn_for_merge["symbol"].astype(str).str.upper()
+panel_clean = panel_clean.merge(
+    earn_for_merge,
+    left_on=["Symbol", "EventDate"],
+    right_on=["symbol", "event_day"],
+    how="left",
+)
+panel_clean["timing"] = panel_clean["timing"].fillna("UNKNOWN").str.upper()
+panel_clean.drop(columns=["symbol", "event_day"], inplace=True)
+
+# ==== ATM event_features (BMO/AMC-aware) ====
+spot_df = pd.read_csv(SPOT_CSV, parse_dates=["date"])
 spot_df["date"] = spot_df["date"].dt.normalize()
 px = "adj_close" if "adj_close" in spot_df.columns else ("close" if "close" in spot_df.columns else None)
-if px is None: raise ValueError("spot_data.csv must contain 'close' or 'adj_close'.")
-spot_df = (spot_df[["symbol","date",px]]
-           .rename(columns={"symbol":"Symbol","date":"Date",px:"Close"})
-           .set_index(["Symbol","Date"]).sort_index())
+if px is None:
+    raise ValueError("spot_data.csv must contain 'close' or 'adj_close'.")
+spot_df = (
+    spot_df[["symbol", "date", px]]
+    .rename(columns={"symbol": "Symbol", "date": "Date", px: "Close"})
+    .set_index(["Symbol", "Date"])
+    .sort_index()
+)
 
-anchors = (panel_clean[panel_clean["t_rel"]==0]
-           .groupby(["Symbol","EventDate"])["ObsDate"]
-           .min().rename("AnchorDate").reset_index())
+def _take_close(symbols, dates):
+    idx = pd.MultiIndex.from_arrays([symbols, dates], names=["Symbol", "Date"])
+    return spot_df.reindex(idx)["Close"].to_numpy()
 
-pc1 = panel_clean[panel_clean["CaseID"]==1].copy()
-pre_c1 = (pc1[pc1["t_rel"]==-1]
-          .groupby(["Symbol","EventDate"],as_index=False)
-          .agg({"MaturityDate":"first","IV":"mean","IV_base":"mean","IV_abn":"mean","TTM_yrs":"mean"})
-          .rename(columns={"MaturityDate":"Maturity_pre","IV":"IV_pre",
-                           "IV_base":"IV_base_pre","IV_abn":"IV_abn_pre","TTM_yrs":"TTM_pre_yrs"}))
-post_c1 = (pc1[pc1["t_rel"]==1]
-           .groupby(["Symbol","EventDate"],as_index=False)
-           .agg({"IV":"mean","IV_abn":"mean"})
-           .rename(columns={"IV":"IV_post","IV_abn":"IV_abn_post"}))
+anchors = (
+    panel_clean[panel_clean["t_rel"] == 0]
+    .groupby(["Symbol", "EventDate"])["ObsDate"]
+    .min()
+    .rename("AnchorDate")
+    .reset_index()
+)
 
-pc3 = panel_clean[panel_clean["CaseID"]==3].copy()
-pre_c3 = (pc3[pc3["t_rel"]==-1]
-          .groupby(["Symbol","EventDate"],as_index=False)
-          .agg({"IV":"mean"})
-          .rename(columns={"IV":"IV_pre_long"}))
+pc1_atm = panel_clean[(panel_clean["CaseID"] == 1) & (panel_clean["MnyTrackID"] == 0)].copy()
+pc3_atm = panel_clean[(panel_clean["CaseID"] == 3) & (panel_clean["MnyTrackID"] == 0)].copy()
 
-event_features = (anchors
-    .merge(pre_c1,on=["Symbol","EventDate"],how="left")
-    .merge(post_c1,on=["Symbol","EventDate"],how="left")
-    .merge(pre_c3,on=["Symbol","EventDate"],how="left"))
+def _pre_post(pc):
+    bmo = pc["timing"] == "BMO"
+    non = ~bmo
+    pre = pd.concat(
+        [pc[bmo & (pc["t_rel"] == -1)], pc[non & (pc["t_rel"] == 0)]],
+        ignore_index=True,
+    )
+    post = pd.concat(
+        [pc[bmo & (pc["t_rel"] == 0)], pc[non & (pc["t_rel"] == 1)]],
+        ignore_index=True,
+    )
+    return pre, post
+
+pre_c1_all, post_c1_all = _pre_post(pc1_atm)
+pre_c1 = (
+    pre_c1_all.groupby(["Symbol", "EventDate"], as_index=False)
+    .agg(
+        {
+            "MaturityDate": "first",
+            "IV": "mean",
+            "IV_base": "mean",
+            "IV_abn": "mean",
+            "TTM_yrs": "mean",
+        }
+    )
+    .rename(
+        columns={
+            "MaturityDate": "Maturity_pre",
+            "IV": "IV_pre",
+            "IV_base": "IV_base_pre",
+            "IV_abn": "IV_abn_pre",
+            "TTM_yrs": "TTM_pre_yrs",
+        }
+    )
+)
+post_c1 = (
+    post_c1_all.groupby(["Symbol", "EventDate"], as_index=False)
+    .agg({"IV": "mean", "IV_abn": "mean"})
+    .rename(columns={"IV": "IV_post", "IV_abn": "IV_abn_post"})
+)
+
+pre_c3_all, _ = _pre_post(pc3_atm)
+pre_c3 = (
+    pre_c3_all.groupby(["Symbol", "EventDate"], as_index=False)
+    .agg({"IV": "mean"})
+    .rename(columns={"IV": "IV_pre_long"})
+)
+
+event_features = (
+    anchors.merge(pre_c1, on=["Symbol", "EventDate"], how="left")
+    .merge(post_c1, on=["Symbol", "EventDate"], how="left")
+    .merge(pre_c3, on=["Symbol", "EventDate"], how="left")
+)
 event_features = event_features[~event_features["IV_pre"].isna()].copy()
 event_features["Crush_1d"] = event_features["IV_post"] - event_features["IV_pre"]
 event_features["TermSlope_pre"] = event_features["IV_pre"] - event_features["IV_pre_long"]
-
-def _take_close(symbols,dates):
-    idx = pd.MultiIndex.from_arrays([symbols,dates],names=["Symbol","Date"])
-    return spot_df.reindex(idx)["Close"].to_numpy()
-
-event_features["S0"] = _take_close(event_features["Symbol"].values, event_features["AnchorDate"].values)
 event_features["AnchorDate_plus1"] = event_features["AnchorDate"] + BDay(1)
+event_features["S0"] = _take_close(event_features["Symbol"].values, event_features["AnchorDate"].values)
 event_features["S1"] = _take_close(event_features["Symbol"].values, event_features["AnchorDate_plus1"].values)
-event_features["R_0_1"] = np.log(event_features["S1"]/event_features["S0"])
-event_features["EV_1d"] = event_features["IV_pre"]*np.sqrt(1/252)
+event_features["R_0_1"] = np.log(event_features["S1"] / event_features["S0"])
+event_features["EV_1d"] = event_features["IV_pre"] * np.sqrt(1 / 252.0)
 event_features["VRP_1d"] = event_features["EV_1d"] - event_features["R_0_1"].abs()
-event_features = (event_features[[
-    "Symbol","EventDate","AnchorDate","Maturity_pre","TTM_pre_yrs",
-    "IV_base_pre","IV_pre","IV_abn_pre","IV_post","IV_abn_post",
-    "Crush_1d","IV_pre_long","TermSlope_pre","S0","S1","R_0_1","EV_1d","VRP_1d"
-]].sort_values(["Symbol","EventDate"]).reset_index(drop=True))
+event_features = event_features[
+    [
+        "Symbol",
+        "EventDate",
+        "AnchorDate",
+        "Maturity_pre",
+        "TTM_pre_yrs",
+        "IV_base_pre",
+        "IV_pre",
+        "IV_abn_pre",
+        "IV_post",
+        "IV_abn_post",
+        "Crush_1d",
+        "IV_pre_long",
+        "TermSlope_pre",
+        "S0",
+        "AnchorDate_plus1",
+        "S1",
+        "R_0_1",
+        "EV_1d",
+        "VRP_1d",
+    ]
+].copy()
 print("event_features:", event_features.shape)
+
+# ==== 9-track event_features (3 cases × 3 mny tracks, explain only) ====
+pc = panel_clean.copy()
+
+def _make_pre_post_tracks(pc, case_id):
+    sub = pc[pc["CaseID"] == case_id].copy()
+    bmo, non = sub["timing"] == "BMO", sub["timing"] != "BMO"
+    pre_all = pd.concat([sub[bmo & (sub["t_rel"] == -1)], sub[non & (sub["t_rel"] == 0)]], ignore_index=True)
+    post_all = pd.concat([sub[bmo & (sub["t_rel"] == 0)], sub[non & (sub["t_rel"] == 1)]], ignore_index=True)
+    pre = (
+        pre_all.groupby(["Symbol", "EventDate", "MnyTrackID"], as_index=False)
+        .agg(
+            {
+                "MaturityDate": "first",
+                "IV": "mean",
+                "IV_base": "mean",
+                "IV_abn": "mean",
+                "TTM_yrs": "mean",
+            }
+        )
+        .rename(
+            columns={
+                "MaturityDate": "Maturity_pre",
+                "IV": "IV_pre",
+                "IV_base": "IV_base_pre",
+                "IV_abn": "IV_abn_pre",
+                "TTM_yrs": "TTM_pre_yrs",
+            }
+        )
+    )
+    post = (
+        post_all.groupby(["Symbol", "EventDate", "MnyTrackID"], as_index=False)
+        .agg({"IV": "mean", "IV_abn": "mean"})
+        .rename(columns={"IV": "IV_post", "IV_abn": "IV_abn_post"})
+    )
+    pre["CaseID"] = case_id
+    post["CaseID"] = case_id
+    return pre.merge(post, on=["Symbol", "EventDate", "MnyTrackID", "CaseID"], how="left")
+
+tracks_case1 = _make_pre_post_tracks(pc, 1)
+tracks_case2 = _make_pre_post_tracks(pc, 2)
+tracks_case3 = _make_pre_post_tracks(pc, 3)
+event_features_all_tracks = pd.concat([tracks_case1, tracks_case2, tracks_case3], ignore_index=True)
+event_features_all_tracks = event_features_all_tracks.merge(anchors, on=["Symbol", "EventDate"], how="left")
+event_features_all_tracks["Crush_1d"] = event_features_all_tracks["IV_post"] - event_features_all_tracks["IV_pre"]
+print("event_features_all_tracks:", event_features_all_tracks.shape)
 
 # ========= Plot data for Excel =========
 iv_abn = event_features["IV_abn_pre"].dropna()
@@ -680,106 +892,86 @@ df_vrp_hist = pd.DataFrame({"BinLeft":bins_vrp[:-1],"BinRight":bins_vrp[1:],
                             "Count":np.histogram(vrp,bins=bins_vrp)[0]})
 
 # Computing the Aggregated panel for smart tables
-# === Aggregated panel: IV_abn and DTE per case, per t_rel ===
+# ==== Aggregate IV_abn over t_rel (ATM only) ====
 agg = (
-    panel_clean[["CaseID", "t_rel", "IV_abn", "TTM_yrs"]]
+    panel_clean[panel_clean["MnyTrackID"] == 0]
     .groupby(["CaseID", "t_rel"], as_index=False)
     .agg(
         IV_abn_mean=("IV_abn", "mean"),
         TTM_yrs_mean=("TTM_yrs", "mean"),
     )
 )
-
-# Pivot IV_abn
 iv_pivot = (
     agg.pivot(index="t_rel", columns="CaseID", values="IV_abn_mean")
-    .rename(columns={
-        1: "IV_abn_Case1",
-        2: "IV_abn_Case2",
-        3: "IV_abn_Case3",
-    })
+    .rename(columns={1: "IV_abn_Case1", 2: "IV_abn_Case2", 3: "IV_abn_Case3"})
 )
-
-# Pivot TTM_yrs -> DTE in days
 dte_pivot = (
     (agg.pivot(index="t_rel", columns="CaseID", values="TTM_yrs_mean") * 365.0)
-    .rename(columns={
-        1: "DTE_days_Case1",
-        2: "DTE_days_Case2",
-        3: "DTE_days_Case3",
-    })
+    .rename(columns={1: "DTE_days_Case1", 2: "DTE_days_Case2", 3: "DTE_days_Case3"})
 )
-
-# Combine IV_abn and DTE
-df_agg = (
-    iv_pivot
-    .join(dte_pivot, how="outer")
-    .sort_index()
-    .reset_index()  # keep t_rel as a column for plotting
-)
+df_agg = iv_pivot.join(dte_pivot, how="outer").sort_index().reset_index()
 
 # ========= Single Excel export (all sheets) =========
 with pd.ExcelWriter(OUT_EXCEL, engine="xlsxwriter") as w:
-
-    panel_clean.to_excel(w, sheet_name="panel_clean", index=False)
-    df_agg.to_excel(w, sheet_name="aggregated_panel_clean", index=False)
     event_features.to_excel(w, sheet_name="event_features", index=False)
+    event_features_all_tracks.to_excel(w, sheet_name="event_features_all_tracks", index=False)
     df_iv_hist.to_excel(w, sheet_name="plot_IVabn_hist", index=False)
     df_iv_vs_crush.to_excel(w, sheet_name="plot_IVabn_vs_Crush", index=False)
     df_termslope_vs_crush.to_excel(w, sheet_name="plot_TermSlope_vs_Crush", index=False)
     df_vrp_hist.to_excel(w, sheet_name="plot_VRP1d_hist", index=False)
 
-    # ========= Regression + signals =========
-    df_reg = event_features.dropna(subset=["Crush_1d", "IV_abn_pre", "TermSlope_pre", "VRP_1d", "R_0_1"]).copy()
+    df_reg = event_features.dropna(
+        subset=["Crush_1d", "IV_abn_pre", "TermSlope_pre", "VRP_1d", "R_0_1"]
+    ).copy()
     for c in ["IV_abn_pre", "TermSlope_pre", "VRP_1d"]:
         df_reg[c + "_z"] = (df_reg[c] - df_reg[c].mean()) / df_reg[c].std()
     y = df_reg["Crush_1d"]
     X = sm.add_constant(df_reg[["IV_abn_pre_z", "TermSlope_pre_z", "VRP_1d_z", "R_0_1"]])
     model = sm.OLS(y, X).fit(cov_type="HC3")
     print(model.summary())
-    coef_table = model.summary2().tables[1].reset_index()
-    coef_table = coef_table.rename(columns={"index": "Variable"})
+    coef_table = model.summary2().tables[1].reset_index().rename(columns={"index": "Variable"})
 
     df_reg["Signal_VolBuildup"] = -df_reg["IV_abn_pre_z"]
     df_reg["Signal_TermSlope"] = -df_reg["TermSlope_pre_z"]
-    df_reg["Signal_Composite"] = 0.6 * df_reg["Signal_VolBuildup"] + 0.4 * df_reg["Signal_TermSlope"]
+    df_reg["Signal_Composite"] = (
+        0.6 * df_reg["Signal_VolBuildup"] + 0.4 * df_reg["Signal_TermSlope"]
+    )
     df_reg["ImpliedMove_1d"] = df_reg["EV_1d"]
     df_reg["RealizedMove_1d"] = df_reg["R_0_1"].abs()
     df_reg["IVCrush_Impact"] = -df_reg["Crush_1d"] * np.sqrt(1 / 252)
-    df_reg["PnL_proxy"] = df_reg["IVCrush_Impact"] + df_reg["RealizedMove_1d"] - df_reg["ImpliedMove_1d"]
+    df_reg["PnL_proxy"] = (
+        df_reg["IVCrush_Impact"] + df_reg["RealizedMove_1d"] - df_reg["ImpliedMove_1d"]
+    )
     df_reg["Signal_quintile"] = pd.qcut(df_reg["Signal_Composite"], 5, labels=False) + 1
-    perf = df_reg.groupby("Signal_quintile")["PnL_proxy"].mean().rename("MeanPnL").to_frame()
-    print(perf)
+    perf = (
+        df_reg.groupby("Signal_quintile")["PnL_proxy"].mean().rename("MeanPnL").to_frame()
+    )
+
     df_reg.to_excel(w, sheet_name="regression_data", index=False)
     perf.to_excel(w, sheet_name="signal_perf")
-    # <<< NEW: write OLS text summary >>>
     coef_table.to_excel(w, sheet_name="OLS_coef_table", index=False)
 
-
-    # raw panels per ticker/case
     for tkr, cases in PANELS.items():
         for case_id, df_case in cases.items():
-            if df_case is not None and not df_case.empty:
-                sheet = f"{tkr}_c{case_id}"[:31]
-
-                cols = [
-                    "symbol",
-                    "event_day",
-                    "case",
-                    "target_expiry",
-                    "date",
-                    "rel",
-                    "iv",
-                    "baseline_IV",
-                    "abn_IV",
-                    "spot",
-                    "strike",
-                    "moneyness",
-                    "is_call",
-                ]
-
-                # keep only the requested columns in that order
-                df_case[cols].to_excel(w, sheet_name=sheet, index=False)
-
+            if df_case is None or df_case.empty:
+                continue
+            sheet = f"{tkr}_c{case_id}"[:31]
+            cols = [
+                "symbol",
+                "event_day",
+                "case",
+                "MnyTrackID",
+                "target_expiry",
+                "date",
+                "rel",
+                "iv",
+                "baseline_IV",
+                "abn_IV",
+                "spot",
+                "strike",
+                "moneyness",
+                "is_call",
+            ]
+            df_case[cols].to_excel(w, sheet_name=sheet, index=False)
 
 print(f"All outputs written to {OUT_EXCEL}")

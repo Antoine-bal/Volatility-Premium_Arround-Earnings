@@ -4,6 +4,7 @@ import os
 import pathlib
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
+import datetime as dt
 
 import numpy as np
 import pandas as pd
@@ -44,7 +45,7 @@ CORP_DIR     = pathlib.Path("alpha_corp_actions")   # *_daily_adjusted.parquet
 OPTIONS_DIR  = pathlib.Path("alpha_options_raw")    # <SYM>.parquet
 EARNINGS_CSV = "earnings.csv"                      # columns: symbol, event_day
 
-OUT_PNL_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\Better_handle_Earnings_timing_strangle.xlsx"
+OUT_PNL_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\Better_handle_Earnings_straddle_signal_S.xlsx"
 
 BACKTEST_CONFIG = {
     "initial_equity_per_ticker": 100.0,
@@ -58,7 +59,8 @@ BACKTEST_CONFIG = {
     "strategy_type": "strangle",      # or "strangle", "straddle"
     "strangle_mny_offset": 0.03,      # 3% OTM for each leg when using strangle
 
-    "use_signal": False,              # reserved
+    "use_signal": True,                     # activate signal-based sizing
+    "signal_mode": "short",                # "short", "long", "long_short"
     "cost_model": {
         "option_spread_bps": 50,
         "stock_spread_bps": 1,
@@ -344,6 +346,146 @@ class StrategyEarningsATM:
 
     def __init__(self, config: dict):
         self.config = config
+        self.entry_exit_map = {}
+        self.signals_df = None
+        self._short_rules = {}
+        self._long_rules = {}
+        self._ls_rules = {}
+        if config.get("use_signal", False):
+            self._load_signals_and_build_rules()
+
+    def _load_signals_and_build_rules(self):
+        cfg = self.config
+        path = cfg.get("signal_csv_path", "outputs/signals_all.csv")
+        if not os.path.exists(path):
+            return
+        d = pd.read_csv(path, parse_dates=["EventDate","AnchorDate"])
+        d = d.dropna(subset=["ShortScore_z","LongScore_z","PnL_proxy"])
+        d["year"] = d["AnchorDate"].dt.year
+        self.signals_df = d
+
+        min_years = cfg.get("signal_min_years", 2)
+        n_bins    = cfg.get("signal_n_bins", 10)
+        max_mult  = cfg.get("signal_max_vega_mult", 2.0)
+
+        self._short_rules = {}
+        self._long_rules  = {}
+        self._ls_rules    = {}
+
+        def quant_edges(s):
+            qs = np.linspace(0,1,n_bins+1)
+            e = np.quantile(s.dropna(), qs)
+            e = np.unique(e)
+            return e if len(e) > 1 else None
+
+        def train_rule(train_df, score_col, pnl_col, flip=False):
+            t = train_df[[score_col, pnl_col]].dropna()
+            if t.empty: return None
+            s = t[score_col]
+            edges = quant_edges(s)
+            if edges is None: return None
+            bins = np.searchsorted(edges, s.values, side="right") - 1
+            pnl = t[pnl_col].values
+            if flip: pnl = -pnl
+            g = pd.Series(pnl).groupby(bins).mean()
+            g = g[g.index >= 0]
+            good = g[g > 0.0]
+            if good.empty: return None
+            mm = good.clip(lower=0.0)
+            vmax = mm.max()
+            mult = (mm / vmax * max_mult) if vmax > 0 else mm*0.0
+            vega_mult = {int(b): float(v) for b,v in mult.items()}
+            return {"edges":edges, "good_bins":set(int(b) for b in good.index), "vega_mult":vega_mult}
+
+        years = sorted(d["year"].unique())
+        for y in years:
+            y_start    = dt.datetime(y,1,1)
+            train_start = y_start - dt.timedelta(days=365*min_years)
+            train = d[(d["AnchorDate"]>=train_start) & (d["AnchorDate"]<y_start)]
+            if train["year"].nunique() < min_years or len(train) < 50:
+                self._short_rules[y] = None
+                self._long_rules[y]  = None
+                self._ls_rules[y]    = None
+                continue
+            short_rule = train_rule(train, "ShortScore_z", "PnL_proxy", flip=False)
+            long_rule  = train_rule(train, "LongScore_z",  "PnL_proxy", flip=True)
+            self._short_rules[y] = short_rule
+            self._long_rules[y]  = long_rule
+            ls_rule = None
+            if short_rule and long_rule:
+                ls_rule = {
+                    "short_edges":short_rule["edges"],
+                    "long_edges": long_rule["edges"],
+                    "short_bins": short_rule["good_bins"],
+                    "long_bins":  long_rule["good_bins"],
+                    "short_mult": short_rule["vega_mult"],
+                    "long_mult":  long_rule["vega_mult"],
+                }
+            self._ls_rules[y] = ls_rule
+
+    def _assign_bin(self, x, edges):
+        if edges is None or pd.isna(x): return None
+        return int(np.searchsorted(edges, x, side="right") - 1)
+
+    def _signal_decision_for_row(self, row: pd.Series, mode: str):
+        y = int(row["AnchorDate"].year)
+        if mode == "short":
+            rule = self._short_rules.get(y)
+            if not rule: return "flat",0.0
+            s = float(row["ShortScore_z"])
+            b = self._assign_bin(s, rule["edges"])
+            if b is None or b not in rule["good_bins"]: return "flat",0.0
+            v = rule["vega_mult"].get(b,0.0)
+            return ("short", v if v>0 else 0.0)
+        if mode == "long":
+            rule = self._long_rules.get(y)
+            if not rule: return "flat",0.0
+            s = float(row["LongScore_z"])
+            b = self._assign_bin(s, rule["edges"])
+            if b is None or b not in rule["good_bins"]: return "flat",0.0
+            v = rule["vega_mult"].get(b,0.0)
+            return ("long", v if v>0 else 0.0)
+        if mode == "long_short":
+            rule = self._ls_rules.get(y)
+            if not rule: return "flat",0.0
+            s_s = float(row["ShortScore_z"]); s_l = float(row["LongScore_z"])
+            b_s = self._assign_bin(s_s, rule["short_edges"])
+            b_l = self._assign_bin(s_l, rule["long_edges"])
+            cand = []
+            if b_s is not None and b_s in rule["short_bins"]:
+                v = rule["short_mult"].get(b_s,0.0)
+                if v>0: cand.append(("short",v))
+            if b_l is not None and b_l in rule["long_bins"]:
+                v = rule["long_mult"].get(b_l,0.0)
+                if v>0: cand.append(("long",v))
+            if not cand: return "flat",0.0
+            cand.sort(key=lambda x: x[1], reverse=True)
+            if len(cand)>=2 and cand[0][1]==cand[1][1]:
+                for side,v in cand:
+                    if side=="short": return "short",v
+            return cand[0]
+        return "flat",0.0
+
+    def compute_signal_vega(self, date: pd.Timestamp, symbol: str, base_vega: float) -> float:
+        if (not self.config.get("use_signal", False)) or self.signals_df is None:
+            return base_vega
+        # only on entry dates
+        mapping_sym = self.entry_exit_map.get(symbol, {})
+        meta = mapping_sym.get(date)
+        if not meta:
+            return 0.0
+        event_day = pd.to_datetime(meta["event_day"]).normalize()
+        d = self.signals_df
+        rows = d[(d["Symbol"]==symbol) & (d["EventDate"]==event_day)]
+        if rows.empty:
+            return 0.0
+        row = rows.iloc[0]
+        mode = self.config.get("signal_mode", "short")
+        side, mult = self._signal_decision_for_row(row, mode)
+        if side == "flat" or mult <= 0:
+            return 0.0
+        v = base_vega * mult
+        return v if side == "short" else -v
 
     def build_entry_exit_map(self, market: MarketData) -> Dict[str, Dict[pd.Timestamp, Dict[str, Any]]]:
         """
@@ -646,9 +788,13 @@ class Backtester:
             equity_scale = st.equity / cfg["initial_equity_per_ticker"]
         else:
             equity_scale = 1.0
-        vega_target = cfg["base_vega_target"] * equity_scale
+        base_vega = cfg["base_vega_target"] * equity_scale
 
-        # Strategy targets on entry dates
+        if cfg.get("use_signal", False):
+            vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega)
+        else:
+            vega_target = base_vega
+
         target_lines = self.strategy.compute_target_positions(
             date, symbol, st, self.market, vega_target
         )

@@ -15,10 +15,34 @@ BASE_URL = "https://www.alphavantage.co/query"
 # ------------------------------------------
 START_DATE = "2020-01-01"
 END_DATE   = "2025-11-16"   # or pd.Timestamp.today().strftime("%Y-%m-%d")
-SYMBOLS = [
+SYMBOLS_top50 = [
     "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
     "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
     "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT","QQQ","SPY"
+]
+
+SYMBOLS = [
+    "GE","MS","AXP","PM","TMUS","MU","GS","RTX","ABT","TMO",
+    "ISRG","INTU","AMGN","LRCX","C","APP","QCOM","UBER","NEE","VZ",
+    "NOW","TJX","APH","SCHW","DHR","BLK","GILD","ACN","BKNG","GEV",
+    "SPGI","ANET","KLAC","BSX","PFE","SYK","WELL","UNP","PGR","COF",
+    "DE","LOW","MDT","ETN","PANW","CRWD","HON","CB","PLD","ADI"
+]
+
+LIST3 = [
+    "HCA","BX","VRTX","COP","MCK","LMT","PH","KKR","CEG","ADP",
+    "CMCSA","CVS","CME","SO","SBUX","HOOD","DUK","BMY","GD","NEM",
+    "TT","MMM","MMC","ICE","WM","MCO","ORLY","AMT","SHW","DELL",
+    "CDNS","DASH","NOC","REGN","HWM","MAR","TDG","ECL","APO","CTAS",
+    "AON","CI","USB","BK","EQIX","MDLZ","PNC","WMB","SNPS","EMR"
+]
+
+LIST4 = [
+    "RCL","ITW","ELV","COR","MNST","JCI","ABNB","GLW","RSG","CL",
+    "CMI","AZO","COIN","TRV","AJG","AEP","TEL","NSC","PWR","CSX",
+    "HLT","FDX","ADSK","MSI","SRE","WDAY","KMI","SPG","FTNT","TFC",
+    "AFL","EOG","IDXX","WBD","MPC","APD","FCX","VST","ROST","ALL",
+    "DDOG","BDX","PCAR","SLB","DLR","PSX","ZTS","VLO","D","O"
 ]
 
 OUT_DIR = pathlib.Path("alpha_options_raw")
