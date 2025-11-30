@@ -27,15 +27,15 @@ except NameError:  # pragma: no cover
 # ===================== CONFIG SECTION =======================
 # ============================================================
 
-SYMBOLS = [
-    "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
-    "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
-    "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
-]
-
 # SYMBOLS = [
-#     "NVDA","MSFT"
+#     "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
+#     "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
+#     "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
 # ]
+
+SYMBOLS = [
+"NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA"
+]
 
 START_DATE = pd.Timestamp("2020-01-01")
 END_DATE   = pd.Timestamp("2025-11-16")
@@ -45,22 +45,45 @@ CORP_DIR     = pathlib.Path("alpha_corp_actions")   # *_daily_adjusted.parquet
 OPTIONS_DIR  = pathlib.Path("alpha_options_raw")    # <SYM>.parquet
 EARNINGS_CSV = "earnings.csv"                      # columns: symbol, event_day
 
-OUT_PNL_EXCEL = r"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs\Better_handle_Earnings_straddle_signal_S.xlsx"
+name_strat = r"\aapl_not_DH.xlsx"
+OUT_PNL_EXCEL = rf"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs{name_strat}"
 
 BACKTEST_CONFIG = {
     "initial_equity_per_ticker": 100.0,
     "reinvest": True,
-    "base_vega_target": 1.0 / 10,
+    "base_vega_target": 1.0 / 20 / 10,
     "multiplier": 100.0,
 
-    # Strategy selection
-    # "straddle" = ATM straddle (your original)
-    # "strangle" = OTM strangle with ± strangle_mny_offset moneyness
-    "strategy_type": "strangle",      # or "strangle", "straddle"
-    "strangle_mny_offset": 0.03,      # 3% OTM for each leg when using strangle
+    # ==========================
+    # Strategy routing
+    # ==========================
+    # "earnings"  -> classic straddle/strangle around earnings
+    # "rolling"   -> daily rolling single-leg option strategy
+    "strategy_mode": "rolling",
 
-    "use_signal": True,                     # activate signal-based sizing
-    "signal_mode": "short",                # "short", "long", "long_short"
+    # Earnings sub-type
+    #   "straddle": ATM C+P
+    #   "strangle": OTM C+P at +/- moneyness offset
+    "earnings_structure": "straddle",   # or "strangle"
+    "strangle_mny_offset": 0.03,
+
+    # Rolling daily option sub-type
+    # Here we implement your “buy a 20δ put on 3rd maturity”
+    "rolling_leg_type": "P",  # "P" or "C"
+    "rolling_select_by": "delta",  # "delta" or "moneyness"
+    "rolling_target_delta": -0.20,  # used if select_by == "delta"
+    "rolling_target_mny": 1.0,  # used if select_by == "moneyness"
+    "rolling_maturity_index": 2,  # 0=nearest, 1=2nd, 2=3rd...
+    "rolling_min_dte": 1,  # optional extra filters
+    "rolling_max_dte": 365,
+    "rolling_holding_days": 20,  # hold each rolling lot for 20 business days
+    "rolling_vega_per_lot": None,  # if None, we auto = base_vega_target / holding_days
+    "rolling_reinvest": False,  # safer default for rolling
+    "rolling_direction": -1,
+
+    # Signal stuff (only meaningful for earnings)
+    "use_signal": False,
+    "signal_mode": "long",    # "short", "long", "ls"
     "cost_model": {
         "option_spread_bps": 50,
         "stock_spread_bps": 1,
@@ -106,6 +129,32 @@ def _flatten_config_dict(d: dict, prefix: str = "") -> List[Dict[str, Any]]:
             rows.append({"Key": key, "Value": v})
     return rows
 
+@dataclass
+class LotSpec:
+    """
+    Strategy-level description of ONE new lot to open today.
+    The backtester will turn this into a concrete lot_id + positions.
+    """
+    symbol: str
+    contract_id: str        # unique key for option
+    expiry: pd.Timestamp
+    strike: float
+    opt_type: str           # "C" or "P"
+    entry_date: pd.Timestamp
+    exit_date: pd.Timestamp
+    qty: float              # signed
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
+class RollingLot:
+    lot_id: int
+    contract_id: str
+    expiry: pd.Timestamp
+    strike: float
+    opt_type: str  # "C" or "P"
+    entry_date: pd.Timestamp
+    exit_date: pd.Timestamp
+    qty: float
 
 @dataclass
 class OptionPosition:
@@ -138,6 +187,13 @@ class TickerState:
     cash: float
 
     positions: Dict[str, OptionPosition] = field(default_factory=dict)
+
+    # Open rolling lots (for strategy_mode="rolling")
+    rolling_lots: List[RollingLot] = field(default_factory=list)
+
+    # NEW: full lot registry per ticker + local counter (for debug if you want)
+    lots: Dict[int, RollingLot] = field(default_factory=dict)
+    next_lot_id: int = 1
 
     # Stock hedge - we distinguish "close" position for PnL semantics
     stock_pos_close: float = 0.0   # shares held at end-of-day (t-1) for PnL_t
@@ -181,6 +237,14 @@ class MarketData:
     # ---------- Spot ----------
     @profile
     def _load_spot(self):
+        """
+        Load spot as a split-normalized series and also keep a per-day split factor.
+
+        - 'spot'         : split-adjusted price (continuous series)
+        - 'price_factor' : used to normalize strikes / moneyness for options
+        - 'split_factor' : raw split coefficient on that date (e.g. 4.0 on a 4-for-1 split,
+                           1.0 on normal days). This is what we will use to rescale positions.
+        """
         for sym in self.symbols:
             path = CORP_DIR / f"{sym}_daily_adjusted.parquet"
             if not path.exists():
@@ -200,6 +264,7 @@ class MarketData:
 
             df = df.sort_values("date").set_index("date")
 
+            # Raw close (unadjusted)
             if "close" in df.columns:
                 close_raw = df["close"].astype(float)
             elif "adj_close" in df.columns:
@@ -207,12 +272,16 @@ class MarketData:
             else:
                 raise ValueError(f"{sym}: neither 'close' nor 'adj_close' in {path}")
 
+            # Split coefficient from Alpha Vantage:
+            #  - 1.0 on normal days
+            #  - k (>1) on split days, e.g. 4.0 for a 4-for-1
             if "split_coefficient" in df.columns:
                 split_raw = df["split_coefficient"].astype(float)
                 split_raw = split_raw.replace(0.0, np.nan).fillna(1.0)
             else:
                 split_raw = pd.Series(1.0, index=df.index)
 
+            # Build price_factor for *normalized* spot (continuous series)
             split_level = split_raw.cumprod()
             level_last = float(split_level.iloc[-1])
             if level_last <= 0:
@@ -225,6 +294,8 @@ class MarketData:
                 {
                     "spot": spot_norm.astype(float),
                     "price_factor": price_factor.astype(float),
+                    # this is what we will use inside the backtester to rescale quantities
+                    "split_factor": split_raw.astype(float),
                 }
             )
             self.spot[sym] = out
@@ -238,6 +309,20 @@ class MarketData:
             return float(df.loc[date, "spot"])
         except KeyError:
             return None
+
+    def get_split_factor(self, symbol: str, date: pd.Timestamp) -> float:
+        """
+        Return the raw split factor for this date:
+          - 1.0 on normal days
+          - k (>1) on split days (e.g. 4.0 for 4-for-1)
+        """
+        df = self.spot.get(symbol)
+        if df is None:
+            return 1.0
+        try:
+            return float(df.loc[date, "split_factor"])
+        except KeyError:
+            return 1.0
 
     def get_spot_calendar(self, symbol: str) -> pd.DatetimeIndex:
         df = self.spot.get(symbol)
@@ -294,6 +379,38 @@ class MarketData:
 
             df["strike_eff"] = df["strike"] / df["price_factor"]
 
+            # -----------------------------------------------------
+            # Derive moneyness if not already present in the file
+            # moneyness ≈ strike_eff / spot
+            # -----------------------------------------------------
+            if "moneyness" not in df.columns:
+                spot_df = self.spot.get(sym)
+                if spot_df is not None and not spot_df.empty:
+                    # merge spot on date
+                    spot_merge = (
+                        spot_df[["spot"]]
+                        .reset_index()
+                        .rename(columns={"spot": "_spot_for_mny"})
+                    )
+                    df = df.merge(spot_merge, on="date", how="left")
+
+                    df["_spot_for_mny"] = df["_spot_for_mny"].astype(float)
+                    # Avoid division by 0
+                    df["moneyness"] = np.where(
+                        df["_spot_for_mny"] > 0,
+                        df["strike_eff"] / df["_spot_for_mny"],
+                        np.nan,
+                    )
+                    df.drop(columns=["_spot_for_mny"], inplace=True)
+
+                # Fallback: try underlying_price if available
+                elif "underlying_price" in df.columns:
+                    up = df["underlying_price"].astype(float)
+                    df["moneyness"] = np.where(up > 0, df["strike_eff"] / up, np.nan)
+                else:
+                    # As a last resort, leave as NaN and let strategy fall back
+                    df["moneyness"] = np.nan
+
             self.options[sym] = df
             print(f"[INFO] Options loaded for {sym}: {df.shape[0]:,} rows")
 
@@ -333,7 +450,7 @@ class MarketData:
 # ===================== STRATEGY LAYER =======================
 # ============================================================
 
-class StrategyEarningsATM:
+class Strategy:
     """
     Straddle / Strangle earnings strategy:
 
@@ -353,6 +470,7 @@ class StrategyEarningsATM:
         self._ls_rules = {}
         if config.get("use_signal", False):
             self._load_signals_and_build_rules()
+        self.backtester = None
 
     def _load_signals_and_build_rules(self):
         cfg = self.config
@@ -428,88 +546,137 @@ class StrategyEarningsATM:
         return int(np.searchsorted(edges, x, side="right") - 1)
 
     def _signal_decision_for_row(self, row: pd.Series, mode: str):
+        """
+        Decide side ('short'/'long'/'flat') and vega multiplier for a single event row.
+
+        mode in:
+          - 'short'       : use ShortScore_z only
+          - 'long'        : use LongScore_z only
+          - 'ls','long_short' : pick the side (short vs long) with better expected PnL
+                                based on training rules.
+        """
         y = int(row["AnchorDate"].year)
+
+        # Normalize mode aliases
+        if mode in ("ls", "long_short", "long-short"):
+            mode = "long_short"
+
         if mode == "short":
             rule = self._short_rules.get(y)
-            if not rule: return "flat",0.0
+            if not rule:
+                return "flat", 0.0
             s = float(row["ShortScore_z"])
             b = self._assign_bin(s, rule["edges"])
-            if b is None or b not in rule["good_bins"]: return "flat",0.0
-            v = rule["vega_mult"].get(b,0.0)
-            return ("short", v if v>0 else 0.0)
+            if b is None or b not in rule["good_bins"]:
+                return "flat", 0.0
+            v = rule["vega_mult"].get(b, 0.0)
+            return ("short", v if v > 0 else 0.0)
+
         if mode == "long":
             rule = self._long_rules.get(y)
-            if not rule: return "flat",0.0
+            if not rule:
+                return "flat", 0.0
             s = float(row["LongScore_z"])
             b = self._assign_bin(s, rule["edges"])
-            if b is None or b not in rule["good_bins"]: return "flat",0.0
-            v = rule["vega_mult"].get(b,0.0)
-            return ("long", v if v>0 else 0.0)
+            if b is None or b not in rule["good_bins"]:
+                return "flat", 0.0
+            v = rule["vega_mult"].get(b, 0.0)
+            return ("long", v if v > 0 else 0.0)
+
         if mode == "long_short":
             rule = self._ls_rules.get(y)
-            if not rule: return "flat",0.0
-            s_s = float(row["ShortScore_z"]); s_l = float(row["LongScore_z"])
+            if not rule:
+                return "flat", 0.0
+
+            s_s = float(row["ShortScore_z"])
+            s_l = float(row["LongScore_z"])
             b_s = self._assign_bin(s_s, rule["short_edges"])
             b_l = self._assign_bin(s_l, rule["long_edges"])
-            cand = []
+
+            candidates = []
+
             if b_s is not None and b_s in rule["short_bins"]:
-                v = rule["short_mult"].get(b_s,0.0)
-                if v>0: cand.append(("short",v))
+                v_s = rule["short_mult"].get(b_s, 0.0)
+                if v_s > 0:
+                    candidates.append(("short", v_s))
+
             if b_l is not None and b_l in rule["long_bins"]:
-                v = rule["long_mult"].get(b_l,0.0)
-                if v>0: cand.append(("long",v))
-            if not cand: return "flat",0.0
-            cand.sort(key=lambda x: x[1], reverse=True)
-            if len(cand)>=2 and cand[0][1]==cand[1][1]:
-                for side,v in cand:
-                    if side=="short": return "short",v
-            return cand[0]
-        return "flat",0.0
+                v_l = rule["long_mult"].get(b_l, 0.0)
+                if v_l > 0:
+                    candidates.append(("long", v_l))
+
+            if not candidates:
+                return "flat", 0.0
+
+            # Pick side with highest vega multiplier; tie → prefer short.
+            candidates.sort(key=lambda x: x[1], reverse=True)
+            if len(candidates) >= 2 and candidates[0][1] == candidates[1][1]:
+                for side, v in candidates:
+                    if side == "short":
+                        return "short", v
+            return candidates[0]
+
+        # Unknown mode → flat
+        return "flat", 0.0
 
     def compute_signal_vega(self, date: pd.Timestamp, symbol: str, base_vega: float) -> float:
+        """
+        Compute signal-adjusted vega target (sign + multiplier) for a given (date, symbol).
+        If no signal or no rule, return 0 (no trade).
+        """
         if (not self.config.get("use_signal", False)) or self.signals_df is None:
             return base_vega
-        # only on entry dates
+
         mapping_sym = self.entry_exit_map.get(symbol, {})
         meta = mapping_sym.get(date)
         if not meta:
+            # only on entry dates
             return 0.0
+
         event_day = pd.to_datetime(meta["event_day"]).normalize()
         d = self.signals_df
-        rows = d[(d["Symbol"]==symbol) & (d["EventDate"]==event_day)]
+        rows = d[(d["Symbol"] == symbol) & (d["EventDate"] == event_day)]
         if rows.empty:
             return 0.0
+
         row = rows.iloc[0]
         mode = self.config.get("signal_mode", "short")
         side, mult = self._signal_decision_for_row(row, mode)
         if side == "flat" or mult <= 0:
             return 0.0
+
         v = base_vega * mult
+        # Earnings convention: short vol = positive vega_target
         return v if side == "short" else -v
+
 
     def build_entry_exit_map(self, market: MarketData) -> Dict[str, Dict[pd.Timestamp, Dict[str, Any]]]:
         """
-        Build per-symbol entry/exit windows for earnings trades.
+        Build any pre-computed entry/exit metadata needed by the strategy.
 
-        Uses:
-          - market.earnings: columns [symbol, event_day, timing, ...]
-          - market.get_spot_calendar(symbol)
-          - self.config['entry_lag'] / ['exit_lag']: dicts by timing
-
-        Returns:
-          { symbol -> { entry_date -> {'event_day', 'exit_date', 'timing'} } }
+        - earnings mode: build per-symbol entry/exit windows for earnings trades
+        - rolling mode: currently no special schedule → empty map
         """
+
+        cfg = self.config
+        mode = cfg.get("strategy_mode", "earnings")
+
+        if mode != "earnings":
+            # No entry/exit concept for daily rolling (trade every day)
+            self.entry_exit_map = {}
+            return self.entry_exit_map
+
+        # === existing earnings-specific logic below ===
 
         # Default lags if config doesn't provide full mapping
         default_entry_lag = {"BMO": -1, "AMC": 0, "DURING": 0, "UNKNOWN": 0}
-        default_exit_lag  = {"BMO": 0,  "AMC": 1, "DURING": 1, "UNKNOWN": 1}
+        default_exit_lag = {"BMO": 0, "AMC": 1, "DURING": 1, "UNKNOWN": 1}
 
-        cfg_entry = self.config.get("entry_lag", {})
-        cfg_exit  = self.config.get("exit_lag", {})
+        cfg_entry = cfg.get("entry_lag", {})
+        cfg_exit = cfg.get("exit_lag", {})
 
-        # Merge defaults with config (config overrides)
         entry_lag_cfg = {**default_entry_lag, **cfg_entry}
-        exit_lag_cfg  = {**default_exit_lag,  **cfg_exit}
+        exit_lag_cfg = {**default_exit_lag, **cfg_exit}
 
         mapping_global: Dict[str, Dict[pd.Timestamp, Dict[str, Any]]] = {}
 
@@ -528,20 +695,17 @@ class StrategyEarningsATM:
                 ev_day = row["event_day"]
                 timing = row.get("timing", "UNKNOWN")
 
-                # anchor index: first trading day >= event_day
                 anchor_idx = cal.searchsorted(ev_day)
                 if anchor_idx >= len(cal):
-                    # event after last available trading day
                     continue
 
-                entry_off = entry_lag_cfg.get(timing, entry_lag_cfg["UNKNOWN"])
-                exit_off  = exit_lag_cfg.get(timing,  exit_lag_cfg["UNKNOWN"])
+                entry_lag = entry_lag_cfg.get(timing, 0)
+                exit_lag = exit_lag_cfg.get(timing, 1)
 
-                entry_idx = anchor_idx + entry_off
-                exit_idx  = anchor_idx + exit_off
+                entry_idx = anchor_idx + entry_lag
+                exit_idx = anchor_idx + exit_lag
 
-                # skip if entry date out of calendar
-                if entry_idx < 0 or entry_idx >= len(cal):
+                if not (0 <= entry_idx < len(cal)):
                     continue
 
                 entry_date = cal[entry_idx]
@@ -567,63 +731,362 @@ class StrategyEarningsATM:
         vega_target: float,
     ) -> List[Dict[str, Any]]:
 
-        cfg = self.config
-        strategy_type = cfg.get("strategy_type", "straddle")
-        targets: List[Dict[str, Any]] = []
+        """
+        Main public entry point.
 
+        It routes to more specific builders based on config:
+          - strategy_mode == "earnings":
+                earnings_structure in {"straddle", "strangle"}
+          - strategy_mode == "rolling":
+                single-leg rolling option (put/call) with generic selection
+        """
+
+        cfg = self.config
+        mode = cfg.get("strategy_mode", "earnings")
+
+        if mode == "earnings":
+            struct = cfg.get("earnings_structure", "straddle")
+            return self._compute_earnings_targets(
+                date=date,
+                symbol=symbol,
+                state=state,
+                market=market,
+                vega_target=vega_target,
+                structure=struct,
+            )
+
+        elif mode == "rolling":
+            return self._compute_rolling_option_targets(
+                date=date,
+                symbol=symbol,
+                state=state,
+                market=market,
+                vega_target=vega_target,
+            )
+
+        else:
+            # Unknown / inactive mode → no trade
+            return []
+
+
+    def _size_vega_legs(
+        self,
+        symbol: str,
+        opt_rows: List[pd.Series],
+        vega_target: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Generic vega-based sizing:
+
+        - opt_rows: list of chosen option rows (each with columns:
+                    contractID, expiration, strike, type, vega, etc.).
+        - vega_target: TOTAL vega magnitude requested at portfolio level.
+                       Sign convention:
+                         * earnings:
+                             vega_target > 0  → SHORT vol (short options)
+                             vega_target < 0  → LONG vol (long options)
+                         * rolling:
+                             we invert sign before calling, so that
+                             vega_target > 0  → LONG vol (long options).
+
+        Returns a list of target dicts with proper "qty".
+        """
+
+        cfg = self.config
+        multiplier = cfg["multiplier"]
+        direction = cfg["rolling_direction"]
+
+        if not opt_rows:
+            return []
+
+        if abs(vega_target) < 1e-12:
+            return []
+
+        mag = abs(vega_target)
+
+        # Collect vegas for each leg
+        legs_with_vega = []
+        for row in opt_rows:
+            v = float(row.get("vega", np.nan))
+            if not np.isfinite(v) or abs(v) < 1e-12:
+                continue
+            legs_with_vega.append((row, v * multiplier))
+
+        if not legs_with_vega:
+            return []
+
+        denom = sum(abs(v) for (_, v) in legs_with_vega)
+        if denom <= 1e-12:
+            return []
+
+        scale = mag / denom
+
+        targets: List[Dict[str, Any]] = []
+        for row, v_per_contract in legs_with_vega:
+            qty = direction * scale  # same scale across legs
+
+            targets.append(
+                {
+                    "contract_id": str(row["contractID"]),
+                    "symbol": symbol,
+                    "expiry": pd.to_datetime(row["expiration"]).normalize(),
+                    "strike": float(row["strike"]),
+                    "type": str(row["type"]).upper(),
+                    "qty": qty,
+                }
+            )
+
+        return targets
+
+    def _compute_earnings_targets(
+        self,
+        date: pd.Timestamp,
+        symbol: str,
+        state: TickerState,
+        market: MarketData,
+        vega_target: float,
+        structure: str,
+    ) -> List[Dict[str, Any]]:
+
+        """
+        Earnings strategies:
+          - structure == "straddle": ATM call + ATM put
+          - structure == "strangle": OTM call/put at +/- offset
+        """
+
+        cfg = self.config
+
+        # Only trade on entry dates
         meta = self.entry_exit_map.get(symbol, {}).get(date)
         if meta is None:
-            return targets
-
-        event_day = meta["event_day"]
-
-        spot = market.get_spot(symbol, date)
-        if spot is None or not np.isfinite(spot):
-            return targets
+            return []
 
         chain = market.get_chain(symbol, date)
         if chain.empty:
-            return targets
-
-        min_mny = cfg["min_moneyness"]
-        max_mny = cfg["max_moneyness"]
-        min_dte = cfg["min_dte_for_entry"]
-        max_dte = cfg["max_dte_for_entry"]
-        strangle_off = cfg.get("strangle_mny_offset", 0.03)
+            return []
 
         chain = chain.copy()
+        chain["expiration"] = pd.to_datetime(chain["expiration"]).dt.normalize()
         chain["dte"] = (chain["expiration"] - date).dt.days
 
-        strike_col = "strike_eff" if "strike_eff" in chain.columns else "strike"
-        chain["moneyness"] = chain[strike_col] / spot
-
-        chain = chain[(chain["moneyness"] >= min_mny) &
-                      (chain["moneyness"] <= max_mny)].copy()
-        if chain.empty:
-            return targets
-
-        after_ev = chain[chain["expiration"] > event_day].copy()
-        if after_ev.empty:
-            return targets
-
-        eligible = after_ev[(after_ev["dte"] >= min_dte) &
-                            (after_ev["dte"] <= max_dte)].copy()
+        min_dte = cfg.get("min_dte_for_entry", 5)
+        max_dte = cfg.get("max_dte_for_entry", 30)
+        eligible = chain[(chain["dte"] >= min_dte) & (chain["dte"] <= max_dte)]
         if eligible.empty:
-            eligible = after_ev.sort_values("dte").copy()
+            return []
 
-        eligible["abs_mny"] = (eligible["moneyness"] - 1.0).abs()
-        eligible = eligible.sort_values(["dte", "abs_mny"])
+        # Pick nearest eligible expiry
+        first = eligible.sort_values("expiration").iloc[0]
+        expiry = first["expiration"]
+        sub = chain[chain["expiration"] == expiry].copy()
+        if sub.empty:
+            return []
 
-        if strategy_type == "straddle":
-            targets = self._build_straddle_targets(eligible, chain, symbol, vega_target)
-        elif strategy_type == "strangle":
-            targets = self._build_strangle_targets(
-                eligible, chain, symbol, vega_target, strangle_off
-            )
-        else:
-            raise ValueError(f"Unknown strategy_type: {strategy_type}")
+        # We need a notion of moneyness; if missing or NaN, rebuild it
+        if ("moneyness" not in sub.columns) or sub["moneyness"].isna().all():
+            spot_today = market.get_spot(symbol, date)
+            if spot_today is None or not np.isfinite(spot_today):
+                return []
 
-        return targets
+            if "strike_eff" in sub.columns:
+                sub["moneyness"] = sub["strike_eff"] / spot_today
+            else:
+                sub["moneyness"] = sub["strike"] / spot_today
+
+        calls = sub[sub["type"].str.upper().str[0] == "C"].copy()
+        puts  = sub[sub["type"].str.upper().str[0] == "P"].copy()
+        if calls.empty or puts.empty:
+            return []
+
+        legs: List[pd.Series] = []
+
+        if structure == "strangle":
+            offset = cfg.get("strangle_mny_offset", 0.03)
+            target_call_mny = 1.0 + offset
+            target_put_mny  = 1.0 - offset
+
+            calls["mny_diff"] = (calls["moneyness"] - target_call_mny).abs()
+            puts["mny_diff"]  = (puts["moneyness"]  - target_put_mny).abs()
+
+        else:  # "straddle" default
+            calls["mny_diff"] = (calls["moneyness"] - 1.0).abs()
+            puts["mny_diff"]  = (puts["moneyness"]  - 1.0).abs()
+
+        call = calls.sort_values("mny_diff").iloc[0]
+        put  = puts.sort_values("mny_diff").iloc[0]
+
+        legs = [call, put]
+
+        # Earnings: vega_target > 0 → short vol (short options).
+        # So we pass vega_target as-is to _size_vega_legs.
+        return self._size_vega_legs(symbol, legs, vega_target)
+
+    def _compute_rolling_option_targets(
+            self,
+            date: pd.Timestamp,
+            symbol: str,
+            state: TickerState,
+            market: MarketData,
+            vega_target: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Rolling single-leg option strategy with *lot tracking*.
+
+        Semantics:
+          - Each trading day:
+              * we keep existing lots whose exit_date >= today,
+              * we drop lots whose exit_date < today,
+              * we open ONE new lot (if possible) on a contract selected by:
+                    leg_type (P/C), maturity_index, select_by (delta/moneyness)
+              * new lot is sized to have vega ~= |vega_target| (per LOT),
+                sign chosen so that we are LONG vol (buy put/call).
+          - Target positions are the sum of all *open* lots per contract.
+        """
+
+        cfg = self.config
+        holding_days = int(cfg.get("rolling_holding_days", 20))
+        holding_days = max(1, holding_days)
+
+        # 1) Keep only lots that are still live as of 'date'
+        open_lots: List[RollingLot] = []
+        for lot in state.rolling_lots:
+            if date <= lot.exit_date:
+                open_lots.append(lot)
+
+        # 2) Try to create today's new lot
+        chain = market.get_chain(symbol, date)
+        if not chain.empty:
+            chain = chain.copy()
+            chain["expiration"] = pd.to_datetime(chain["expiration"]).dt.normalize()
+            chain["dte"] = (chain["expiration"] - date).dt.days
+
+            # Global DTE filter for rolling
+            min_dte = cfg.get("rolling_min_dte", 1)
+            max_dte = cfg.get("rolling_max_dte", 365)
+            chain = chain[(chain["dte"] >= min_dte) & (chain["dte"] <= max_dte)]
+
+            if not chain.empty:
+                leg_type = cfg.get("rolling_leg_type", "P").upper()
+                chain = chain[chain["type"].str.upper().str[0] == leg_type]
+
+                if not chain.empty:
+                    expiries = sorted(chain["expiration"].unique())
+                    if expiries:
+                        idx = cfg.get("rolling_maturity_index", 0)
+                        if idx >= len(expiries):
+                            idx = len(expiries) - 1
+                        expiry = expiries[idx]
+
+                        sub = chain[chain["expiration"] == expiry].copy()
+                        if not sub.empty:
+                            select_by = cfg.get("rolling_select_by", "delta")
+
+                            if select_by == "delta":
+                                if "delta" not in sub.columns:
+                                    sub = pd.DataFrame()
+                                else:
+                                    target_delta = cfg.get("rolling_target_delta", -0.20)
+                                    sub["sel_diff"] = (sub["delta"] - target_delta).abs()
+                            elif select_by == "moneyness":
+                                if "moneyness" not in sub.columns:
+                                    sub = pd.DataFrame()
+                                else:
+                                    target_mny = cfg.get("rolling_target_mny", 1.0)
+                                    sub["sel_diff"] = (sub["moneyness"] - target_mny).abs()
+                            else:
+                                sub = pd.DataFrame()
+
+                            if not sub.empty:
+                                row = sub.sort_values("sel_diff").iloc[0]
+
+                                vega_for_sizing = vega_target
+                                sized = self._size_vega_legs(symbol, [row], vega_for_sizing)
+
+                                if sized:
+                                    leg = sized[0]
+
+                                    # Compute exit_date on spot calendar
+                                    cal = market.get_spot_calendar(symbol)
+                                    if len(cal) > 0:
+                                        try:
+                                            cur_idx = cal.get_loc(date)
+                                        except KeyError:
+                                            cur_idx = cal.searchsorted(date)
+                                        exit_idx = cur_idx + holding_days - 1
+                                        if exit_idx >= len(cal):
+                                            exit_idx = len(cal) - 1
+                                        exit_date = cal[exit_idx]
+                                    else:
+                                        exit_date = date + pd.tseries.offsets.BDay(
+                                            holding_days - 1
+                                        )
+
+                                    # *** IMPORTANT: do NOT hold beyond expiry ***
+                                    expiry_dt = pd.to_datetime(leg["expiry"]).normalize()
+                                    exit_date = min(exit_date, expiry_dt)
+
+                                    lot_id = self.backtester.register_new_lot(
+                                        symbol=symbol,
+                                        contract_id=leg["contract_id"],
+                                        expiry=leg["expiry"],
+                                        strike=leg["strike"],
+                                        opt_type=leg["type"],
+                                        entry_date=date,
+                                        exit_date=exit_date,
+                                        qty=leg["qty"],
+                                        meta={"mode": "rolling"},
+                                    )
+
+                                    new_lot = RollingLot(
+                                        lot_id=lot_id,
+                                        contract_id=leg["contract_id"],
+                                        expiry=leg["expiry"],
+                                        strike=leg["strike"],
+                                        opt_type=leg["type"],
+                                        entry_date=date,
+                                        exit_date=exit_date,
+                                        qty=leg["qty"],
+                                    )
+                                    open_lots.append(new_lot)
+
+                                    self.backtester.rolling_entries_log.append({
+                                        "date": date,
+                                        "symbol": symbol,
+                                        "lot_id": lot_id,
+                                        "contract_id": leg["contract_id"],
+                                        "expiry": leg["expiry"],
+                                        "days_to_expiry_on_entry": int((leg["expiry"] - date).days),
+                                        "close_date": exit_date,
+                                        "strike": float(leg["strike"]),
+                                        "option_type": leg["type"],
+                                        "qty": float(leg["qty"]),
+                                        "delta_on_entry": float(row.get("delta", np.nan)),
+                                        "vega_on_entry": float(row.get("vega", np.nan)),
+                                        "vega_exposure": float(row.get("vega", np.nan))
+                                                         * cfg["multiplier"]
+                                                         * float(leg["qty"]),
+                                        "note": "ROLL_ENTRY",
+                                    })
+
+        # Update state with currently open lots
+        state.rolling_lots = open_lots
+
+        # 3) Aggregate open lots per contract -> target positions
+        by_cid: Dict[str, Dict[str, Any]] = {}
+        for lot in open_lots:
+            cid = lot.contract_id
+            if cid not in by_cid:
+                by_cid[cid] = {
+                    "contract_id": cid,
+                    "symbol": symbol,
+                    "expiry": lot.expiry,
+                    "strike": lot.strike,
+                    "type": lot.opt_type,
+                    "qty": 0.0,
+                }
+            by_cid[cid]["qty"] += lot.qty
+
+        return list(by_cid.values())
 
     def _build_straddle_targets(
         self,
@@ -739,12 +1202,18 @@ class Backtester:
         self.config = config
         self.symbols = symbols
         self.market = MarketData(symbols)
-        self.strategy = StrategyEarningsATM(config)
+        self.strategy = Strategy(config)
+        self.strategy.backtester = self
         self.strategy.build_entry_exit_map(self.market)
-
 
         self.daily_pnl_rows: List[Dict[str, Any]] = []
         self.trade_rows: List[Dict[str, Any]] = []
+        self.rolling_entries_log: List[Dict[str, Any]] = []
+
+        # NEW: global lot registry + daily live lots
+        self.all_lots: Dict[int, Dict[str, Any]] = {}
+        self.live_lots_by_date: Dict[pd.Timestamp, List[int]] = {}
+        self._next_lot_id: int = 1
 
         self.state: Dict[str, TickerState] = {
             sym: TickerState(
@@ -773,53 +1242,147 @@ class Backtester:
         all_dates = sorted(set().union(*[set(idx) for idx in calendars]))
         return pd.DatetimeIndex(all_dates)
 
+    def register_new_lot(
+        self,
+        symbol: str,
+        contract_id: str,
+        expiry: pd.Timestamp,
+        strike: float,
+        opt_type: str,
+        entry_date: pd.Timestamp,
+        exit_date: pd.Timestamp,
+        qty: float,
+        meta: Optional[Dict[str, Any]] = None,
+    ) -> int:
+        """Create a new lot_id, store it globally + per-ticker, and return lot_id."""
+        lot_id = self._next_lot_id
+        self._next_lot_id += 1
+
+        # Global view (for debugging / PnL attribution)
+        self.all_lots[lot_id] = {
+            "lot_id": lot_id,
+            "symbol": symbol,
+            "contract_id": contract_id,
+            "expiry": expiry,
+            "strike": float(strike),
+            "opt_type": opt_type,
+            "entry_date": entry_date,
+            "exit_date": exit_date,
+            "qty": float(qty),
+            "meta": meta or {},
+        }
+
+        # Per-ticker registry
+        st = self.state[symbol]
+        lot = RollingLot(
+            lot_id=lot_id,
+            contract_id=contract_id,
+            expiry=expiry,
+            strike=float(strike),
+            opt_type=opt_type,
+            entry_date=entry_date,
+            exit_date=exit_date,
+            qty=float(qty),
+        )
+        st.lots[lot_id] = lot
+
+        return lot_id
+
     @profile
     def _process_symbol_date(self, symbol: str, date: pd.Timestamp):
         st = self.state[symbol]
         cfg = self.config
         equity_prev = st.equity
 
+        # Spot (already split-normalized)
         spot = self.market.get_spot(symbol, date)
         if spot is None or not np.isfinite(spot):
             return
 
-        # vega target scaling
-        if cfg["reinvest"]:
-            equity_scale = st.equity / cfg["initial_equity_per_ticker"]
-        else:
-            equity_scale = 1.0
-        base_vega = cfg["base_vega_target"] * equity_scale
+        # ====== NEW: corporate action handling (splits) ======
+        # If there is a split today, rescale ALL existing quantities so
+        # economic exposure remains continuous across the split.
+        split_factor = self.market.get_split_factor(symbol, date)
+        if abs(split_factor - 1.0) > 1e-8:
+            for pos in st.positions.values():
+                pos.qty *= split_factor
+            st.stock_pos_close *= split_factor
+            st.stock_pos_intraday *= split_factor
+        # =====================================================
 
-        if cfg.get("use_signal", False):
-            vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega)
-        else:
-            vega_target = base_vega
+        mode = cfg.get("strategy_mode", "earnings")
 
+        # -------------------------------
+        # 1) Compute vega_target for today
+        # -------------------------------
+        if mode == "earnings":
+            if cfg["reinvest"]:
+                equity_scale = st.equity / cfg["initial_equity_per_ticker"]
+            else:
+                equity_scale = 1.0
+            base_vega = cfg["base_vega_target"] * equity_scale
+
+            if cfg.get("use_signal", False):
+                vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega)
+            else:
+                vega_target = base_vega
+
+        elif mode == "rolling":
+            holding_days = int(cfg.get("rolling_holding_days", 20))
+            holding_days = max(1, holding_days)
+
+            raw_per_lot = cfg.get("rolling_vega_per_lot", None)
+            if raw_per_lot is None:
+                rolling_vega_per_lot = cfg["base_vega_target"] / holding_days
+            else:
+                rolling_vega_per_lot = float(raw_per_lot)
+
+            if cfg.get("rolling_reinvest", False):
+                equity_scale = st.equity / cfg["initial_equity_per_ticker"]
+            else:
+                equity_scale = 1.0
+
+            vega_target = rolling_vega_per_lot * equity_scale
+        else:
+            vega_target = 0.0
+
+        # -------------------------------
+        # 2) Strategy target positions
+        # -------------------------------
         target_lines = self.strategy.compute_target_positions(
             date, symbol, st, self.market, vega_target
         )
 
-        # Exit logic: flat on any event exit date
-        mapping_sym = self.strategy.entry_exit_map.get(symbol, {})
-        need_flat = any(
-            meta_ev.get("exit_date") == date
-            for meta_ev in mapping_sym.values()
-        )
-        if need_flat:
-            target_lines = []
+        # Earnings: flat on any exit date
+        if mode == "earnings":
+            mapping_sym = self.strategy.entry_exit_map.get(symbol, {})
+            need_flat = any(
+                meta_ev.get("exit_date") == date
+                for meta_ev in mapping_sym.values()
+            )
+            if need_flat:
+                target_lines = []
+        else:
+            need_flat = False
 
-        chain_today = self.market.get_chain(symbol, date)
-        if chain_today.empty and st.positions:
-            return
-
+        chain_today = self.market.get_chain(symbol, date).drop_duplicates()
         if not chain_today.empty:
             chain_today = chain_today.copy()
             chain_today["cid"] = chain_today["contractID"].astype(str)
             chain_today_idx = chain_today.set_index("cid")
+            cids_today = set(chain_today["cid"])
         else:
             chain_today_idx = None
+            cids_today = set()
 
-        # carry prev greeks
+        # -------------------------------
+        # 3) Drop zombie positions
+        # -------------------------------
+        for cid in list(st.positions.keys()):
+            if cid not in cids_today:
+                del st.positions[cid]
+
+        # Carry previous greeks/prices for decomposition
         for pos in st.positions.values():
             pos.prev_iv = pos.iv
             pos.prev_delta = pos.delta
@@ -828,7 +1391,9 @@ class Backtester:
             pos.prev_theta = pos.theta
             pos.prev_price = pos.last_price
 
-        # target qty map
+        # -------------------------------
+        # 4) Build target qty map
+        # -------------------------------
         target_qty: Dict[str, float] = {}
         for t in target_lines:
             cid = t["contract_id"]
@@ -843,12 +1408,25 @@ class Backtester:
         option_spread_bps = cost_model["option_spread_bps"]
         commission_per_contract = cost_model["commission_per_contract"]
 
-        pnl_tc_options = 0.0
+        # TC trackers
+        pnl_tc_opt = 0.0  # options TC (spread + commissions)
+        pnl_tc_stock = 0.0  # stock TC (spread on delta hedge)
 
+        # Union of contracts we might touch today
         contract_ids = set(st.positions.keys()) | set(target_qty.keys())
+
+        # -------------------------------
+        # 5) Trade options toward targets
+        # -------------------------------
         for cid in contract_ids:
             cur_pos = st.positions.get(cid)
-            tgt_qty = target_qty.get(cid, cur_pos.qty if cur_pos else 0.0)
+
+            if mode == "rolling":
+                # In rolling mode, silence = flat
+                tgt_qty = target_qty.get(cid, 0.0)
+            else:
+                # Earnings/others: silence = keep
+                tgt_qty = target_qty.get(cid, cur_pos.qty if cur_pos else 0.0)
 
             if chain_today_idx is None:
                 continue
@@ -878,11 +1456,14 @@ class Backtester:
                 else:
                     trade_price = mid_price * (1 - spread)
 
+                # Cash impact (incl. spread)
                 cash_change = -trade_qty * trade_price * cfg["multiplier"]
-                commission = abs(trade_qty) * commission_per_contract
+                st.cash += cash_change
 
-                st.cash += cash_change - commission
-                pnl_tc_options += commission
+                # TC decomposition: spread + commissions (both positive costs)
+                tc_spread = abs(trade_price - mid_price) * abs(trade_qty) * cfg["multiplier"]
+                tc_comm = abs(trade_qty) * commission_per_contract
+                pnl_tc_opt += (tc_spread + tc_comm)
 
                 self.trade_rows.append({
                     "Date": date,
@@ -902,6 +1483,7 @@ class Backtester:
                     "Theta": theta,
                 })
 
+            # Update / delete position
             if abs(tgt_qty) <= 1e-10:
                 if cid in st.positions:
                     del st.positions[cid]
@@ -931,11 +1513,12 @@ class Backtester:
                     cur_pos.vega = vega
                     cur_pos.theta = theta
 
-        # --- Delta hedge semantics ---
+        # -------------------------------
+        # 6) Delta hedging + TC on stock
+        # -------------------------------
         pnl_delta_hedge = 0.0
 
         if cfg["delta_hedge"]:
-            # target delta hedge using today's updated option deltas
             port_delta = sum(
                 pos.delta * pos.qty * pos.multiplier
                 for pos in st.positions.values()
@@ -953,21 +1536,24 @@ class Backtester:
                 cash_change = -trade_shares * trade_price
                 st.cash += cash_change
 
-            # PnL from holding stock between yesterday's close and today:
+                # TC from stock spread
+                tc_stock = abs(trade_price - spot) * abs(trade_shares)
+                pnl_tc_stock += tc_stock
+
             if st.last_spot is not None:
                 dS = spot - st.last_spot
                 pnl_delta_hedge = st.stock_pos_close * dS
 
-            # at EoD, we define "close" stock position as tgt_stock_pos
             st.stock_pos_intraday = tgt_stock_pos
             st.stock_pos_close = tgt_stock_pos
         else:
-            # No active hedging, but if you have a static stock position, you still get PnL
             if st.last_spot is not None:
                 dS = spot - st.last_spot
                 pnl_delta_hedge = st.stock_pos_close * dS
 
-        # --- PnL decomposition ---
+        # -------------------------------
+        # 7) PnL decomposition
+        # -------------------------------
         option_pnl = 0.0
         port_gamma_prev = 0.0
         port_vega_prev = 0.0
@@ -993,7 +1579,7 @@ class Backtester:
                 port_theta_prev += pos.prev_theta * pos.qty * pos.multiplier
 
             if (pos.prev_iv is not None and
-                np.isfinite(pos.prev_iv) and np.isfinite(pos.iv)):
+                    np.isfinite(pos.prev_iv) and np.isfinite(pos.iv)):
                 dIV = pos.iv - pos.prev_iv
                 w = abs(pos.prev_vega * pos.qty * pos.multiplier)
                 dIV_weighted_num += w * dIV
@@ -1009,17 +1595,15 @@ class Backtester:
             dS = spot - st.last_spot
 
         dt = 1.0 / 252.0
-
-        if dIV_weighted_den > 0:
-            dIV_eff = dIV_weighted_num / dIV_weighted_den
-        else:
-            dIV_eff = 0.0
+        dIV_eff = dIV_weighted_num / dIV_weighted_den if dIV_weighted_den > 0 else 0.0
 
         pnl_gamma = 0.5 * port_gamma_prev * (dS ** 2)
         pnl_vega = port_vega_prev * dIV_eff
         pnl_theta = port_theta_prev * dt
 
-        # --- MTM & equity ---
+        # -------------------------------
+        # 8) MTM & equity
+        # -------------------------------
         mtm_options = sum(
             pos.last_price * pos.qty * pos.multiplier
             for pos in st.positions.values()
@@ -1032,12 +1616,15 @@ class Backtester:
         st.equity = st.cash + mtm_options + mtm_stock
         pnl_total = st.equity - equity_prev
 
+        # Total TC today
+        pnl_tc_total = pnl_tc_opt + pnl_tc_stock
+
         st.cum_pnl += pnl_total
         st.cum_pnl_vega += pnl_vega
         st.cum_pnl_gamma += pnl_gamma
         st.cum_pnl_theta += pnl_theta
         st.cum_pnl_delta_hedge += pnl_delta_hedge
-        st.cum_pnl_tc += pnl_tc_options
+        st.cum_pnl_tc += pnl_tc_total
 
         row = {
             "Date": date,
@@ -1047,22 +1634,21 @@ class Backtester:
             "MTM_Options": st.mtm_options,
             "MTM_Stock": st.mtm_stock,
             "Spot": spot,
-
             "DailyPnL": pnl_total,
             "OptionPnL": option_pnl,
             "PnL_gamma": pnl_gamma,
             "PnL_vega": pnl_vega,
             "PnL_theta": pnl_theta,
             "PnL_deltaHedge": pnl_delta_hedge,
-            "PnL_TC": pnl_tc_options,
-
+            "PnL_TC": pnl_tc_total,
+            "PnL_TC_Options": pnl_tc_opt,
+            "PnL_TC_Stock": pnl_tc_stock,
             "CumPnL": st.cum_pnl,
             "CumPnL_gamma": st.cum_pnl_gamma,
             "CumPnL_vega": st.cum_pnl_vega,
-            "CumPnL_theta": st.cum_pnl_theta,
+            "CumPnL_theta": st.cum_pnl_vega,
             "CumPnL_deltaHedge": st.cum_pnl_delta_hedge,
             "CumPnL_TC": st.cum_pnl_tc,
-
             "Delta": port_delta_today,
             "Gamma": port_gamma_today,
             "Vega": port_vega_today,
@@ -1072,7 +1658,12 @@ class Backtester:
 
         st.last_spot = spot
 
-    # ---------- Export ----------
+        # Live lot ids snapshot (rolling only)
+        if mode != "earnings":
+            live_ids = [lot.lot_id for lot in st.rolling_lots]
+            live_list = self.live_lots_by_date.setdefault(date, [])
+            live_list.extend(live_ids)
+
     def _export_results(self):
         if not self.daily_pnl_rows:
             print("[WARN] No PnL rows to export.")
@@ -1334,14 +1925,17 @@ class Backtester:
             df_earn.to_excel(writer, sheet_name="EARNINGS", index=False)
 
             # 5) CORP_ACTIONS
-            df_corp.to_excel(writer, sheet_name="CORP_ACTIONS", index=False)
+            df_corp[df_corp['SplitFactor']>1].to_excel(writer, sheet_name="CORP_ACTIONS", index=False)
 
             # 6) ALL_TRADES
             if not df_trades_all.empty:
                 df_trades_all.sort_values(["Date", "Symbol"]).to_excel(
                     writer, sheet_name="ALL_TRADES", index=False
                 )
-
+            # 6b) ALL TRADES WHEN ROLL STRAT
+            if self.config.get("strategy_mode") == "rolling" and self.rolling_entries_log:
+                df_roll = pd.DataFrame(self.rolling_entries_log)
+                df_roll.to_excel(writer, sheet_name="ROLL_ENTRIES", index=False)
             # 7) Per-symbol sheets
             for sym in self.symbols:
                 df_sym = df[df["Symbol"] == sym].copy()
@@ -1357,6 +1951,17 @@ class Backtester:
 
         print(f"[INFO] Backtest results written to {OUT_PNL_EXCEL}")
 
+    def build_new_lots_for_date(
+        self,
+        date: pd.Timestamp,
+        market: MarketData,
+        symbol_states: Dict[str, TickerState],
+    ) -> List[LotSpec]:
+        """
+        Return the list of NEW lots to open on this date across all symbols.
+        May be empty.
+        """
+        raise NotImplementedError
 
 # ============================================================
 # ============================= MAIN =========================
@@ -1366,11 +1971,11 @@ if __name__ == "__main__":
     bt = Backtester(BACKTEST_CONFIG, SYMBOLS)
     # If you want line_profiler:
     # if LineProfiler is not None:
-    #     lp = LineProfiler()
-    #     lp.add_function(Backtester._process_symbol_date)
-    #     lp.add_function(StrategyEarningsATM.compute_target_positions)
-    #     lp_wrapper = lp(bt.run)
-    #     lp_wrapper()
-    #     lp.print_stats()
+    # lp = LineProfiler()
+    # lp.add_function(Strategy._compute_rolling_option_targets)
+    # # lp.add_function(Strategy.compute_target_positions)
+    # lp_wrapper = lp(bt.run)
+    # lp_wrapper()
+    # lp.print_stats()
     # else:
     bt.run()
