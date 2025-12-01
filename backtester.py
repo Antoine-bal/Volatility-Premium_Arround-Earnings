@@ -1,5 +1,3 @@
-# earnings_backtest.py
-
 import os
 import pathlib
 from dataclasses import dataclass, field
@@ -22,7 +20,6 @@ except NameError:  # pragma: no cover
     def profile(func):
         return func
 
-
 # ============================================================
 # ===================== CONFIG SECTION =======================
 # ============================================================
@@ -34,7 +31,7 @@ except NameError:  # pragma: no cover
 # ]
 
 SYMBOLS = [
-"NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA"
+"NVDA","MSFT"
 ]
 
 START_DATE = pd.Timestamp("2020-01-01")
@@ -45,14 +42,13 @@ CORP_DIR     = pathlib.Path("alpha_corp_actions")   # *_daily_adjusted.parquet
 OPTIONS_DIR  = pathlib.Path("alpha_options_raw")    # <SYM>.parquet
 EARNINGS_CSV = "earnings.csv"                      # columns: symbol, event_day
 
-name_strat = r"\aapl_not_DH.xlsx"
+name_strat = r"\spy_ndq.xlsx"
 OUT_PNL_EXCEL = rf"C:\Users\antoi\Documents\Antoine\Projets_Python\Trading Vol on Earnings\outputs{name_strat}"
 
 BACKTEST_CONFIG = {
     "initial_equity_per_ticker": 100.0,
     "reinvest": True,
     "base_vega_target": 1.0 / 20 / 10,
-    "multiplier": 100.0,
 
     # ==========================
     # Strategy routing
@@ -114,7 +110,6 @@ BACKTEST_CONFIG = {
     "max_dte_for_entry": 30,
 }
 
-
 # ============================================================
 # ===================== DATA STRUCTURES ======================
 # ============================================================
@@ -146,6 +141,19 @@ class LotSpec:
     meta: Dict[str, Any] = field(default_factory=dict)
 
 @dataclass
+class LotInfo:
+    lot_id: int
+    symbol: str
+    contract_id: str
+    expiry: pd.Timestamp
+    strike: float
+    opt_type: str
+    entry_date: pd.Timestamp
+    exit_date: pd.Timestamp
+    qty: float
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+@dataclass
 class RollingLot:
     lot_id: int
     contract_id: str
@@ -170,7 +178,7 @@ class OptionPosition:
     gamma: float
     vega: float
     theta: float
-    multiplier: float = 100.0
+    split_factor_since_open: float
 
     # previous greeks for decomposition
     prev_iv: Optional[float] = None
@@ -185,36 +193,24 @@ class OptionPosition:
 class TickerState:
     equity: float
     cash: float
-
     positions: Dict[str, OptionPosition] = field(default_factory=dict)
-
     # Open rolling lots (for strategy_mode="rolling")
     rolling_lots: List[RollingLot] = field(default_factory=list)
-
-    # NEW: full lot registry per ticker + local counter (for debug if you want)
+    # Lot registry per ticker
     lots: Dict[int, RollingLot] = field(default_factory=dict)
     next_lot_id: int = 1
-
-    # Stock hedge - we distinguish "close" position for PnL semantics
-    stock_pos_close: float = 0.0   # shares held at end-of-day (t-1) for PnL_t
-    stock_pos_intraday: float = 0.0  # current position being traded today
-
+    # Stock hedge positions
+    stock_pos_close: float = 0.0   # shares held at end-of-day (t-1)
+    stock_pos_intraday: float = 0.0  # current stock position being adjusted
     last_spot: Optional[float] = None
-
     mtm_options: float = 0.0
     mtm_stock: float = 0.0
-
     cum_pnl: float = 0.0
     cum_pnl_vega: float = 0.0
     cum_pnl_gamma: float = 0.0
     cum_pnl_theta: float = 0.0
     cum_pnl_delta_hedge: float = 0.0
     cum_pnl_tc: float = 0.0
-
-
-# ============================================================
-# ===================== MARKET DATA LAYER ====================
-# ============================================================
 
 class MarketData:
     """
@@ -223,7 +219,6 @@ class MarketData:
       - full options chain per (symbol, date)
       - earnings events + entry/exit mapping
     """
-
     def __init__(self, symbols: List[str]):
         self.symbols = symbols
         self.spot: Dict[str, pd.DataFrame] = {}
@@ -275,8 +270,8 @@ class MarketData:
             # Split coefficient from Alpha Vantage:
             #  - 1.0 on normal days
             #  - k (>1) on split days, e.g. 4.0 for a 4-for-1
-            if "split_coefficient" in df.columns:
-                split_raw = df["split_coefficient"].astype(float)
+            if "split_coeff" in df.columns:
+                split_raw = df["split_coeff"].astype(float)
                 split_raw = split_raw.replace(0.0, np.nan).fillna(1.0)
             else:
                 split_raw = pd.Series(1.0, index=df.index)
@@ -290,14 +285,12 @@ class MarketData:
             price_factor = level_last / split_level
             spot_norm = close_raw / price_factor
 
-            out = pd.DataFrame(
-                {
-                    "spot": spot_norm.astype(float),
-                    "price_factor": price_factor.astype(float),
-                    # this is what we will use inside the backtester to rescale quantities
-                    "split_factor": split_raw.astype(float),
-                }
-            )
+            out = pd.DataFrame({
+                "spot": close_raw,
+                # "price_factor": price_factor.astype(float),
+                "split_factor": split_raw.astype(float),
+            })
+            out.index = split_level.index
             self.spot[sym] = out
             print(f"[INFO] Spot loaded for {sym}: {out.shape[0]} days")
 
@@ -314,7 +307,7 @@ class MarketData:
         """
         Return the raw split factor for this date:
           - 1.0 on normal days
-          - k (>1) on split days (e.g. 4.0 for 4-for-1)
+          - k (>1) on split days (e.g. 4.0 for a 4-for-1)
         """
         df = self.spot.get(symbol)
         if df is None:
@@ -338,12 +331,7 @@ class MarketData:
             if not path.exists():
                 print(f"[WARN] Options file missing for {sym}: {path}")
                 continue
-
             df = pd.read_parquet(path)
-            if "date" not in df.columns or "expiration" not in df.columns:
-                print(f"[WARN] Missing date/expiration in options for {sym}, skipping.")
-                continue
-
             df["date"] = pd.to_datetime(df["date"]).dt.normalize()
             df["expiration"] = pd.to_datetime(df["expiration"]).dt.normalize()
             df["strike"] = df["strike"].astype(float)
@@ -354,16 +342,16 @@ class MarketData:
                 print(f"[WARN] No option rows for {sym} in backtest window.")
                 continue
 
+            # Merge split_factor for strike normalization
             spot_df = self.spot.get(sym)
-            if spot_df is not None and "price_factor" in spot_df.columns:
-                pf = spot_df[["price_factor"]].reset_index()
+            if spot_df is not None and "split_factor" in spot_df.columns:
+                pf = spot_df[["split_factor"]].reset_index()
                 df = df.merge(pf, on="date", how="left")
             else:
-                df["price_factor"] = 1.0
+                df["split_factor"] = 1.0
+            df["split_factor"] = df["split_factor"].fillna(1.0).astype(float)
 
-            df["price_factor"] = df["price_factor"].fillna(1.0).astype(float)
-
-            # mid price from mark/bid-ask/last
+            # Compute mid price from bid/ask or mark/last
             if "mark" in df.columns:
                 df["mid"] = df["mark"].astype(float)
             else:
@@ -374,44 +362,40 @@ class MarketData:
                     0.5 * (bid + ask),
                     df.get("last", np.nan).astype(float),
                 )
-
             df = df[df["mid"] > 0]
+            df["mid"] = df["mid"]
+            if "bid" in df.columns:
+                df["bid"] = df["bid"].astype(float)
+            if "ask" in df.columns:
+                df["ask"] = df["ask"].astype(float)
+            for greek in ["delta", "gamma", "vega", "theta"]:
+                if greek in df.columns:
+                    df[greek] = df[greek].astype(float)
 
-            df["strike_eff"] = df["strike"] / df["price_factor"]
-
-            # -----------------------------------------------------
-            # Derive moneyness if not already present in the file
-            # moneyness ≈ strike_eff / spot
-            # -----------------------------------------------------
+            # Normalize strike for split-adjusted moneyness calculation
+            df["strike_eff"] = df["strike"] / df["split_factor"]
+            # Derive moneyness if not provided
             if "moneyness" not in df.columns:
-                spot_df = self.spot.get(sym)
-                if spot_df is not None and not spot_df.empty:
-                    # merge spot on date
-                    spot_merge = (
-                        spot_df[["spot"]]
-                        .reset_index()
-                        .rename(columns={"spot": "_spot_for_mny"})
-                    )
+                spot_merge = (
+                    spot_df[["spot"]].reset_index().rename(columns={"spot": "_spot_for_mny"})
+                    if spot_df is not None and not spot_df.empty else None
+                )
+                if spot_merge is not None:
                     df = df.merge(spot_merge, on="date", how="left")
-
                     df["_spot_for_mny"] = df["_spot_for_mny"].astype(float)
-                    # Avoid division by 0
                     df["moneyness"] = np.where(
                         df["_spot_for_mny"] > 0,
                         df["strike_eff"] / df["_spot_for_mny"],
-                        np.nan,
+                        np.nan
                     )
                     df.drop(columns=["_spot_for_mny"], inplace=True)
-
-                # Fallback: try underlying_price if available
                 elif "underlying_price" in df.columns:
                     up = df["underlying_price"].astype(float)
                     df["moneyness"] = np.where(up > 0, df["strike_eff"] / up, np.nan)
                 else:
-                    # As a last resort, leave as NaN and let strategy fall back
                     df["moneyness"] = np.nan
 
-            self.options[sym] = df
+            self.options[sym] = df.drop_duplicates()
             print(f"[INFO] Options loaded for {sym}: {df.shape[0]:,} rows")
 
     def get_chain(self, symbol: str, date: pd.Timestamp) -> pd.DataFrame:
@@ -428,16 +412,12 @@ class MarketData:
             return
 
         df = pd.read_csv(EARNINGS_CSV)
-
         df["symbol"] = df["symbol"].astype(str).str.upper()
         df["event_day"] = pd.to_datetime(df["event_day"]).dt.normalize()
-
-        # If timing exists in CSV (BMO/AMC/...), keep it; else default to UNKNOWN
         if "timing" in df.columns:
             df["timing"] = df["timing"].astype(str).str.upper()
         else:
             df["timing"] = "UNKNOWN"
-
         df = df[df["symbol"].isin(self.symbols)].copy()
         df = df[(df["event_day"] >= START_DATE) & (df["event_day"] <= END_DATE)].copy()
         df = df.drop_duplicates(subset=["symbol", "event_day"]).reset_index(drop=True)
@@ -453,14 +433,11 @@ class MarketData:
 class Strategy:
     """
     Straddle / Strangle earnings strategy:
-
     - On entry date (T-1):
       - "straddle": short vega_target of ATM front-month straddle
-      - "strangle": short vega_target of symmetric OTM strangle
-                    with ± strangle_mny_offset around ATM
+      - "strangle": short vega_target of symmetric OTM strangle with ± strangle_mny_offset around ATM
     - On exit date (T+1): flat
     """
-
     def __init__(self, config: dict):
         self.config = config
         self.entry_exit_map = {}
@@ -793,7 +770,6 @@ class Strategy:
         """
 
         cfg = self.config
-        multiplier = cfg["multiplier"]
         direction = cfg["rolling_direction"]
 
         if not opt_rows:
@@ -810,7 +786,7 @@ class Strategy:
             v = float(row.get("vega", np.nan))
             if not np.isfinite(v) or abs(v) < 1e-12:
                 continue
-            legs_with_vega.append((row, v * multiplier))
+            legs_with_vega.append((row, v))
 
         if not legs_with_vega:
             return []
@@ -1063,7 +1039,6 @@ class Strategy:
                                         "delta_on_entry": float(row.get("delta", np.nan)),
                                         "vega_on_entry": float(row.get("vega", np.nan)),
                                         "vega_exposure": float(row.get("vega", np.nan))
-                                                         * cfg["multiplier"]
                                                          * float(leg["qty"]),
                                         "note": "ROLL_ENTRY",
                                     })
@@ -1147,30 +1122,29 @@ class Strategy:
         return self._size_vega_straddle(symbol, call, put, vega_target)
 
     def _size_vega_straddle(
-        self,
-        symbol: str,
-        call: pd.Series,
-        put: pd.Series,
-        vega_target: float,
+            self,
+            symbol: str,
+            call: pd.Series,
+            put: pd.Series,
+            vega_target: float,
     ) -> List[Dict[str, Any]]:
 
         cfg = self.config
-        multiplier = cfg["multiplier"]
 
         call_vega = float(call["vega"])
-        put_vega  = float(put["vega"])
-        tot_vega  = abs(call_vega) + abs(put_vega)
+        put_vega = float(put["vega"])
+        tot_vega = abs(call_vega) + abs(put_vega)
         if tot_vega <= 1e-8:
             return []
 
-        vega_per_call = call_vega * multiplier
-        vega_per_put  = put_vega * multiplier
+        vega_per_call = call_vega
+        vega_per_put = put_vega
         if abs(vega_per_call) <= 1e-8 or abs(vega_per_put) <= 1e-8:
             return []
 
         target_vega_each = -0.5 * vega_target
         qty_call = target_vega_each / vega_per_call
-        qty_put  = target_vega_each / vega_per_put
+        qty_put = target_vega_each / vega_per_put
 
         targets = [
             {
@@ -1206,15 +1180,18 @@ class Backtester:
         self.strategy.backtester = self
         self.strategy.build_entry_exit_map(self.market)
 
+        # Results storage
         self.daily_pnl_rows: List[Dict[str, Any]] = []
         self.trade_rows: List[Dict[str, Any]] = []
         self.rolling_entries_log: List[Dict[str, Any]] = []
+        self.roll_portfolio_rows: List[Dict[str, Any]] = []
 
-        # NEW: global lot registry + daily live lots
+        # Global lot registry + live lots tracking
         self.all_lots: Dict[int, Dict[str, Any]] = {}
         self.live_lots_by_date: Dict[pd.Timestamp, List[int]] = {}
         self._next_lot_id: int = 1
 
+        # Initialize state for each symbol
         self.state: Dict[str, TickerState] = {
             sym: TickerState(
                 equity=config["initial_equity_per_ticker"],
@@ -1258,7 +1235,7 @@ class Backtester:
         lot_id = self._next_lot_id
         self._next_lot_id += 1
 
-        # Global view (for debugging / PnL attribution)
+        # Global registry for lot (for PnL attribution or debugging)
         self.all_lots[lot_id] = {
             "lot_id": lot_id,
             "symbol": symbol,
@@ -1271,8 +1248,7 @@ class Backtester:
             "qty": float(qty),
             "meta": meta or {},
         }
-
-        # Per-ticker registry
+        # Per-ticker registry of lot
         st = self.state[symbol]
         lot = RollingLot(
             lot_id=lot_id,
@@ -1285,7 +1261,6 @@ class Backtester:
             qty=float(qty),
         )
         st.lots[lot_id] = lot
-
         return lot_id
 
     @profile
@@ -1294,21 +1269,26 @@ class Backtester:
         cfg = self.config
         equity_prev = st.equity
 
-        # Spot (already split-normalized)
+        # Spot price for this date (already split-adjusted)
         spot = self.market.get_spot(symbol, date)
         if spot is None or not np.isfinite(spot):
             return
+        # Initialize option PnL breakdown variables for this day
+        option_pnl_entry = 0.0
+        option_pnl_close = 0.0
+        option_pnl_expire = 0.0
 
-        # ====== NEW: corporate action handling (splits) ======
-        # If there is a split today, rescale ALL existing quantities so
-        # economic exposure remains continuous across the split.
+        # ====== Corporate action handling (splits) ======
         split_factor = self.market.get_split_factor(symbol, date)
-        if abs(split_factor - 1.0) > 1e-8:
+        if split_factor > 1:
+                # Adjust all existing positions and lots for stock split
             for pos in st.positions.values():
                 pos.qty *= split_factor
-            st.stock_pos_close *= split_factor
-            st.stock_pos_intraday *= split_factor
-        # =====================================================
+                pos.split_factor_since_open *= split_factor
+            # Adjust any open rolling lots for split (track adjusted strike and qty)
+            for lot in st.rolling_lots:
+                lot.qty *= split_factor
+                # lot.strike /= split_factor
 
         mode = cfg.get("strategy_mode", "earnings")
 
@@ -1316,56 +1296,33 @@ class Backtester:
         # 1) Compute vega_target for today
         # -------------------------------
         if mode == "earnings":
-            if cfg["reinvest"]:
-                equity_scale = st.equity / cfg["initial_equity_per_ticker"]
-            else:
-                equity_scale = 1.0
+            equity_scale = st.equity / cfg["initial_equity_per_ticker"] if cfg["reinvest"] else 1.0
             base_vega = cfg["base_vega_target"] * equity_scale
-
-            if cfg.get("use_signal", False):
-                vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega)
-            else:
-                vega_target = base_vega
-
+            vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega) if cfg.get("use_signal", False) else base_vega
         elif mode == "rolling":
-            holding_days = int(cfg.get("rolling_holding_days", 20))
-            holding_days = max(1, holding_days)
-
-            raw_per_lot = cfg.get("rolling_vega_per_lot", None)
-            if raw_per_lot is None:
-                rolling_vega_per_lot = cfg["base_vega_target"] / holding_days
-            else:
-                rolling_vega_per_lot = float(raw_per_lot)
-
-            if cfg.get("rolling_reinvest", False):
-                equity_scale = st.equity / cfg["initial_equity_per_ticker"]
-            else:
-                equity_scale = 1.0
-
+            holding_days = max(1, int(cfg.get("rolling_holding_days", 20)))
+            rolling_vega_per_lot = float(cfg.get("rolling_vega_per_lot") or (cfg["base_vega_target"] / holding_days))
+            equity_scale = st.equity / cfg["initial_equity_per_ticker"] if cfg.get("rolling_reinvest", False) else 1.0
             vega_target = rolling_vega_per_lot * equity_scale
         else:
             vega_target = 0.0
 
         # -------------------------------
-        # 2) Strategy target positions
+        # 2) Determine target option positions
         # -------------------------------
-        target_lines = self.strategy.compute_target_positions(
-            date, symbol, st, self.market, vega_target
-        )
+        target_lines = self.strategy.compute_target_positions(date, symbol, st, self.market, vega_target)
 
-        # Earnings: flat on any exit date
+        # Earnings strategy: if today is an exit date, go flat
         if mode == "earnings":
             mapping_sym = self.strategy.entry_exit_map.get(symbol, {})
-            need_flat = any(
-                meta_ev.get("exit_date") == date
-                for meta_ev in mapping_sym.values()
-            )
+            need_flat = any(meta_ev.get("exit_date") == date for meta_ev in mapping_sym.values())
             if need_flat:
                 target_lines = []
         else:
             need_flat = False
 
-        chain_today = self.market.get_chain(symbol, date).drop_duplicates()
+        # Get today's option chain and index by contract ID
+        chain_today = self.market.get_chain(symbol, date)
         if not chain_today.empty:
             chain_today = chain_today.copy()
             chain_today["cid"] = chain_today["contractID"].astype(str)
@@ -1376,13 +1333,30 @@ class Backtester:
             cids_today = set()
 
         # -------------------------------
-        # 3) Drop zombie positions
+        # 3) Handle expired or delisted positions (drop zombies)
         # -------------------------------
         for cid in list(st.positions.keys()):
-            if cid not in cids_today:
+            pos = st.positions[cid]
+            # If we've reached or passed expiry, and the option is still in the book, force expiry payoff.
+            if pos.expiry <= date:
+                spot_expiry = self.market.get_spot(symbol, date)
+                if spot_expiry is None or not np.isfinite(spot_expiry):
+                    continue  # defensively skip if we have no spot
+
+                if pos.opt_type == "C":
+                    intrinsic = max(0.0, spot_expiry / pos.split_factor_since_open - pos.strike )
+                else:
+                    intrinsic = max(0.0, pos.strike / pos.split_factor_since_open- spot_expiry )
+
+                exp_cash = pos.qty * intrinsic  # short qty → negative if ITM
+                option_pnl_expire += exp_cash
+                st.cash += exp_cash
+                print('expired on', date, 'with expiry =',pos.expiry)
+
+                # Remove the position from the book (no MTM from tomorrow)
                 del st.positions[cid]
 
-        # Carry previous greeks/prices for decomposition
+        # Carry over previous Greeks and price for PnL decomposition
         for pos in st.positions.values():
             pos.prev_iv = pos.iv
             pos.prev_delta = pos.delta
@@ -1392,13 +1366,12 @@ class Backtester:
             pos.prev_price = pos.last_price
 
         # -------------------------------
-        # 4) Build target qty map
+        # 4) Build target quantity map (desired end-of-day positions)
         # -------------------------------
         target_qty: Dict[str, float] = {}
         for t in target_lines:
             cid = t["contract_id"]
             target_qty[cid] = target_qty.get(cid, 0.0) + float(t["qty"])
-
         if need_flat:
             for cid in list(st.positions.keys()):
                 if cid not in target_qty:
@@ -1408,29 +1381,21 @@ class Backtester:
         option_spread_bps = cost_model["option_spread_bps"]
         commission_per_contract = cost_model["commission_per_contract"]
 
-        # TC trackers
-        pnl_tc_opt = 0.0  # options TC (spread + commissions)
-        pnl_tc_stock = 0.0  # stock TC (spread on delta hedge)
+        # Track transaction costs
+        pnl_tc_opt = 0.0  # options total TC (spread + commission)
+        pnl_tc_stock = 0.0  # stock hedge TC
 
-        # Union of contracts we might touch today
+        # Determine contracts we need to trade (union of current and target)
         contract_ids = set(st.positions.keys()) | set(target_qty.keys())
 
         # -------------------------------
-        # 5) Trade options toward targets
+        # 5) Trade options to reach target positions
         # -------------------------------
         for cid in contract_ids:
             cur_pos = st.positions.get(cid)
-
-            if mode == "rolling":
-                # In rolling mode, silence = flat
-                tgt_qty = target_qty.get(cid, 0.0)
-            else:
-                # Earnings/others: silence = keep
-                tgt_qty = target_qty.get(cid, cur_pos.qty if cur_pos else 0.0)
-
+            tgt_qty = target_qty.get(cid, 0.0) if mode == "rolling" else target_qty.get(cid, cur_pos.qty if cur_pos else 0.0)
             if chain_today_idx is None:
                 continue
-
             try:
                 row = chain_today_idx.loc[cid]
             except KeyError:
@@ -1450,22 +1415,20 @@ class Backtester:
             trade_qty = tgt_qty - cur_qty
 
             if abs(trade_qty) > 1e-10:
+                # Determine trade execution price (mid +/- spread)
                 spread = option_spread_bps / 1e4
-                if trade_qty > 0:
-                    trade_price = mid_price * (1 + spread)
-                else:
-                    trade_price = mid_price * (1 - spread)
-
-                # Cash impact (incl. spread)
-                cash_change = -trade_qty * trade_price * cfg["multiplier"]
+                trade_price = mid_price * (1 + spread) if trade_qty > 0 else mid_price * (1 - spread)
+                # Cash flow from trade (positive if cash received, negative if paid)
+                cash_change = -trade_qty * trade_price
                 st.cash += cash_change
 
-                # TC decomposition: spread + commissions (both positive costs)
-                tc_spread = abs(trade_price - mid_price) * abs(trade_qty) * cfg["multiplier"]
+                # Transaction costs (spread slippage + commission)
+                tc_spread = abs(trade_price - mid_price) * abs(trade_qty)
                 tc_comm = abs(trade_qty) * commission_per_contract
                 pnl_tc_opt += (tc_spread + tc_comm)
 
-                self.trade_rows.append({
+                # Prepare trade record
+                trade_record = {
                     "Date": date,
                     "Symbol": symbol,
                     "ContractID": cid,
@@ -1474,21 +1437,60 @@ class Backtester:
                     "Type": opt_type,
                     "TradeQty": trade_qty,
                     "TradePrice": trade_price,
-                    "TradeNotional": trade_qty * trade_price * cfg["multiplier"],
+                    "TradeNotional": trade_qty * trade_price,
                     "Spot": spot,
                     "IV": iv,
                     "Delta": delta,
                     "Gamma": gamma,
                     "Vega": vega,
                     "Theta": theta,
-                })
+                }
+                # Allocate PnL to entry/close categories
+                if cur_pos is None:
+                    # Opened a new position
+                    option_pnl_entry += cash_change
+                    # Link CloseDate for this entry trade (from lot exit_date)
+                    close_date = None
+                    for lot in self.all_lots.values():
+                        if lot["symbol"] == symbol and lot["contract_id"] == cid and lot["entry_date"] == date:
+                            close_date = lot.get("exit_date")
+                            break
+                    if close_date is not None:
+                        trade_record["CloseDate"] = close_date
+                else:
+                    # Adjusting an existing position
+                    if cur_pos.qty * tgt_qty < 0:
+                        # Position side flipped (closed current and opened opposite)
+                        # Split cash_change into closing and opening parts by quantity ratio
+                        close_qty = -cur_qty  # amount closed to flatten current
+                        entry_qty = tgt_qty   # new position quantity after flip
+                        if abs(trade_qty) > 1e-8:
+                            cash_close = cash_change * (abs(close_qty) / abs(trade_qty))
+                            cash_entry = cash_change * (abs(entry_qty) / abs(trade_qty))
+                        else:
+                            cash_close = cash_entry = 0.0
+                        option_pnl_close += cash_close
+                        option_pnl_entry += cash_entry
+                        print('should not flip', date)
+                    else:
+                        if abs(tgt_qty) > abs(cur_pos.qty):
+                            # Increased position in same direction
+                            option_pnl_entry += cash_change
+                            print('should not increase', date)
+                        elif abs(tgt_qty) < abs(cur_pos.qty):
+                            # Reduced position (partial or full close)
+                            option_pnl_close += cash_change
+                # Append trade record
+                self.trade_rows.append(trade_record)
 
-            # Update / delete position
+            # Update or remove position in the book
             if abs(tgt_qty) <= 1e-10:
+                # Target is zero -> close the position
                 if cid in st.positions:
                     del st.positions[cid]
             else:
                 if cur_pos is None:
+                    # New position opened
                     st.positions[cid] = OptionPosition(
                         contract_id=cid,
                         symbol=symbol,
@@ -1502,9 +1504,10 @@ class Backtester:
                         gamma=gamma,
                         vega=vega,
                         theta=theta,
-                        multiplier=cfg["multiplier"],
+                        split_factor_since_open=1.0
                     )
                 else:
+                    # Position exists, just update its fields and quantity
                     cur_pos.qty = tgt_qty
                     cur_pos.last_price = mid_price
                     cur_pos.iv = iv
@@ -1514,36 +1517,24 @@ class Backtester:
                     cur_pos.theta = theta
 
         # -------------------------------
-        # 6) Delta hedging + TC on stock
+        # 6) Delta hedging (stock) + TC on stock
         # -------------------------------
         pnl_delta_hedge = 0.0
-
         if cfg["delta_hedge"]:
-            port_delta = sum(
-                pos.delta * pos.qty * pos.multiplier
-                for pos in st.positions.values()
-            )
+            port_delta = sum(pos.delta * pos.qty for pos in st.positions.values())
             tgt_stock_pos = -port_delta
             trade_shares = tgt_stock_pos - st.stock_pos_intraday
-
             if abs(trade_shares) > 1e-8:
                 spread = cost_model["stock_spread_bps"] / 1e4
-                if trade_shares > 0:
-                    trade_price = spot * (1 + spread)
-                else:
-                    trade_price = spot * (1 - spread)
-
+                trade_price = spot * (1 + spread) if trade_shares > 0 else spot * (1 - spread)
                 cash_change = -trade_shares * trade_price
                 st.cash += cash_change
-
-                # TC from stock spread
+                # Transaction cost for stock trade (spread only, commission assumed negligible or included above)
                 tc_stock = abs(trade_price - spot) * abs(trade_shares)
                 pnl_tc_stock += tc_stock
-
             if st.last_spot is not None:
                 dS = spot - st.last_spot
                 pnl_delta_hedge = st.stock_pos_close * dS
-
             st.stock_pos_intraday = tgt_stock_pos
             st.stock_pos_close = tgt_stock_pos
         else:
@@ -1552,7 +1543,7 @@ class Backtester:
                 pnl_delta_hedge = st.stock_pos_close * dS
 
         # -------------------------------
-        # 7) PnL decomposition
+        # 7) Option PnL decomposition (Greek attribution for analysis only)
         # -------------------------------
         option_pnl = 0.0
         port_gamma_prev = 0.0
@@ -1568,32 +1559,31 @@ class Backtester:
 
         for pos in st.positions.values():
             if pos.prev_price is not None:
-                dP = (pos.last_price - pos.prev_price) * pos.qty * pos.multiplier
+                dP = (pos.last_price - pos.prev_price) * pos.qty
                 option_pnl += dP
 
             if pos.prev_gamma is not None:
-                port_gamma_prev += pos.prev_gamma * pos.qty * pos.multiplier
+                port_gamma_prev += pos.prev_gamma * pos.qty
             if pos.prev_vega is not None:
-                port_vega_prev += pos.prev_vega * pos.qty * pos.multiplier
+                port_vega_prev += pos.prev_vega * pos.qty
             if pos.prev_theta is not None:
-                port_theta_prev += pos.prev_theta * pos.qty * pos.multiplier
+                port_theta_prev += pos.prev_theta * pos.qty
 
             if (pos.prev_iv is not None and
                     np.isfinite(pos.prev_iv) and np.isfinite(pos.iv)):
                 dIV = pos.iv - pos.prev_iv
-                w = abs(pos.prev_vega * pos.qty * pos.multiplier)
+                w = abs(pos.prev_vega * pos.qty)
                 dIV_weighted_num += w * dIV
                 dIV_weighted_den += w
 
-            port_delta_today += pos.delta * pos.qty * pos.multiplier
-            port_gamma_today += pos.gamma * pos.qty * pos.multiplier
-            port_vega_today += pos.vega * pos.qty * pos.multiplier
-            port_theta_today += pos.theta * pos.qty * pos.multiplier
+            port_delta_today += pos.delta * pos.qty
+            port_gamma_today += pos.gamma * pos.qty
+            port_vega_today += pos.vega * pos.qty
+            port_theta_today += pos.theta * pos.qty
 
         dS = 0.0
         if st.last_spot is not None:
             dS = spot - st.last_spot
-
         dt = 1.0 / 252.0
         dIV_eff = dIV_weighted_num / dIV_weighted_den if dIV_weighted_den > 0 else 0.0
 
@@ -1602,23 +1592,22 @@ class Backtester:
         pnl_theta = port_theta_prev * dt
 
         # -------------------------------
-        # 8) MTM & equity
+        # 8) Mark-to-market & equity update
         # -------------------------------
-        mtm_options = sum(
-            pos.last_price * pos.qty * pos.multiplier
-            for pos in st.positions.values()
-        )
+        mtm_options = sum(pos.last_price * pos.qty for pos in st.positions.values())
         mtm_stock = st.stock_pos_close * spot
 
         st.mtm_options = mtm_options
         st.mtm_stock = mtm_stock
 
+        # Compute end-of-day equity from cash + MTM (realized + unrealized PnL)
         st.equity = st.cash + mtm_options + mtm_stock
         pnl_total = st.equity - equity_prev
 
-        # Total TC today
+        # Total transaction costs today
         pnl_tc_total = pnl_tc_opt + pnl_tc_stock
 
+        # Update cumulative PnL trackers
         st.cum_pnl += pnl_total
         st.cum_pnl_vega += pnl_vega
         st.cum_pnl_gamma += pnl_gamma
@@ -1626,6 +1615,7 @@ class Backtester:
         st.cum_pnl_delta_hedge += pnl_delta_hedge
         st.cum_pnl_tc += pnl_tc_total
 
+        # Prepare daily PnL row with breakdown
         row = {
             "Date": date,
             "Symbol": symbol,
@@ -1635,7 +1625,9 @@ class Backtester:
             "MTM_Stock": st.mtm_stock,
             "Spot": spot,
             "DailyPnL": pnl_total,
-            "OptionPnL": option_pnl,
+            "OptionPnL_Entry": option_pnl_entry,
+            "OptionPnL_Close": option_pnl_close,
+            "OptionPnL_Expire": option_pnl_expire,
             "PnL_gamma": pnl_gamma,
             "PnL_vega": pnl_vega,
             "PnL_theta": pnl_theta,
@@ -1646,7 +1638,7 @@ class Backtester:
             "CumPnL": st.cum_pnl,
             "CumPnL_gamma": st.cum_pnl_gamma,
             "CumPnL_vega": st.cum_pnl_vega,
-            "CumPnL_theta": st.cum_pnl_vega,
+            "CumPnL_theta": st.cum_pnl_theta,
             "CumPnL_deltaHedge": st.cum_pnl_delta_hedge,
             "CumPnL_TC": st.cum_pnl_tc,
             "Delta": port_delta_today,
@@ -1655,160 +1647,150 @@ class Backtester:
             "Theta": port_theta_today,
         }
         self.daily_pnl_rows.append(row)
-
         st.last_spot = spot
 
-        # Live lot ids snapshot (rolling only)
+        # Track live lot IDs for rolling strategy (for debugging or analysis)
         if mode != "earnings":
             live_ids = [lot.lot_id for lot in st.rolling_lots]
-            live_list = self.live_lots_by_date.setdefault(date, [])
-            live_list.extend(live_ids)
+            self.live_lots_by_date.setdefault(date, []).extend(live_ids)
+
+          # NEW: end-of-day portfolio snapshot per lot (rolling strategy)
+            if chain_today_idx is not None:
+                for lot in st.rolling_lots:
+                    cid = str(lot.contract_id)
+                    snap = {
+                        "Date": date,
+                        "Symbol": symbol,
+                        "LotID": lot.lot_id,
+                        "ContractID": cid,
+                        "EntryDate": lot.entry_date,
+                        "ExitDate": lot.exit_date,
+                        "Expiry": lot.expiry,
+                        "Strike": float(lot.strike),
+                        "Type": lot.opt_type,
+                        "Qty": float(lot.qty),
+                    }
+                    try:
+                        row_opt = chain_today_idx.loc[cid]
+                        mid = float(row_opt["mid"])
+                        iv = float(row_opt.get("implied_volatility", np.nan))
+                        delta = float(row_opt.get("delta", np.nan))
+                        gamma = float(row_opt.get("gamma", np.nan))
+                        vega = float(row_opt.get("vega", np.nan))
+                        theta = float(row_opt.get("theta", np.nan))
+                    except KeyError:
+                        # Option not in today chain (delisted / missing data)
+                        mid = np.nan
+                        iv = delta = gamma = vega = theta = np.nan
+
+                    snap.update(
+                        {
+                            "Mid": mid,
+                            "MTM": mid * snap["Qty"] if np.isfinite(mid) else np.nan,
+                            "IV": iv,
+                            "Delta": delta,
+                            "Gamma": gamma,
+                            "Vega": vega,
+                            "Theta": theta,
+                            "Spot": spot,
+                        }
+                    )
+                    self.roll_portfolio_rows.append(snap)
+
 
     def _export_results(self):
         if not self.daily_pnl_rows:
             print("[WARN] No PnL rows to export.")
             return
+        df = pd.DataFrame(self.daily_pnl_rows).sort_values(["Date", "Symbol"]).reset_index(drop=True)
+        df = df.bfill()  # forward-fill any NaNs for missing days per symbol
 
-        df = pd.DataFrame(self.daily_pnl_rows)
-        df = df.sort_values(["Date", "Symbol"]).reset_index(drop=True)
-        df = df.bfill()
-
+        # Pivot equity per symbol and compute total portfolio equity
         pivot_equity = df.pivot(index="Date", columns="Symbol", values="Equity")
         pivot_equity["PortfolioEquity"] = pivot_equity.sum(axis=1)
 
+        # Flatten config dict to dataframe
         config_rows = _flatten_config_dict(self.config)
         df_config = pd.DataFrame(config_rows, columns=["Key", "Value"])
 
+        # Prepare earnings events table
         df_earn = self.market.earnings.copy()
         if df_earn.empty:
             df_earn = pd.DataFrame(columns=["Symbol", "EventDay"])
         else:
             df_earn = df_earn.sort_values(["symbol", "event_day"]).copy()
-            df_earn = df_earn.rename(
-                columns={"symbol": "Symbol", "event_day": "EventDay"}
-            )
+            df_earn = df_earn.rename(columns={"symbol": "Symbol", "event_day": "EventDay"})
 
-        # --- Corporate actions table (reworked) ---
+        # Build corporate actions table (splits/dividends) for reference
         def _build_corp_actions_df() -> pd.DataFrame:
             corp_rows = []
-
             for sym in self.symbols:
                 path = CORP_DIR / f"{sym}_daily_adjusted.parquet"
                 if not path.exists():
                     print(f"[CORP] Missing daily_adjusted file for {sym}: {path}")
                     continue
-
                 df_c = pd.read_parquet(path)
-
                 if "date" not in df_c.columns:
                     print(f"[CORP] No 'date' column in {path}, skipping {sym}")
                     continue
-
                 df_c["date"] = pd.to_datetime(df_c["date"]).dt.normalize()
-                df_c = df_c[(df_c["date"] >= START_DATE) &
-                            (df_c["date"] <= END_DATE)].copy()
+                df_c = df_c[(df_c["date"] >= START_DATE) & (df_c["date"] <= END_DATE)].copy()
                 if df_c.empty:
-                    print(f"[CORP] No rows for {sym} in backtest window.")
                     continue
-
-                # Try to detect dividend / split columns in a flexible way
                 lower_cols = {c.lower(): c for c in df_c.columns}
-
                 div_col = None
                 split_col = None
-
                 for lc, orig in lower_cols.items():
                     if "dividend" in lc:
                         div_col = orig
                     if "split" in lc:
                         split_col = orig
-
                 if div_col is None and split_col is None:
-                    print(f"[CORP] No dividend/split columns for {sym}. "
-                          f"Columns: {list(df_c.columns)}")
                     continue
-
-                # Build mask of rows where something actually happened
                 mask = False
                 if div_col is not None:
                     mask = (df_c[div_col].fillna(0).astype(float) != 0)
                 if split_col is not None:
-                    # split factor != 1 means actual split
                     split_mask = (df_c[split_col].fillna(1).astype(float) != 1)
                     mask = mask | split_mask if isinstance(mask, pd.Series) else split_mask
-
                 df_c = df_c[mask]
                 if df_c.empty:
-                    print(f"[CORP] No non-zero dividends/splits for {sym} in window.")
                     continue
-
                 cols = ["date"]
                 if div_col is not None:
                     cols.append(div_col)
                 if split_col is not None:
                     cols.append(split_col)
-
                 df_c = df_c[cols].copy()
                 df_c["Symbol"] = sym
-
-                # Normalize column names
                 rename_map = {"date": "Date"}
                 if div_col is not None:
                     rename_map[div_col] = "Dividend"
                 if split_col is not None:
                     rename_map[split_col] = "SplitFactor"
-
                 df_c = df_c.rename(columns=rename_map)
                 corp_rows.append(df_c)
-
             if not corp_rows:
-                print("[CORP] No corporate actions found for any symbol.")
                 return pd.DataFrame(columns=["Symbol", "Date", "Dividend", "SplitFactor"])
-
             df_corp = pd.concat(corp_rows, ignore_index=True)
-            # Ensure standard column order
-            for col in ["Dividend", "SplitFactor"]:
-                if col not in df_corp.columns:
-                    df_corp[col] = np.nan
-
-            df_corp = df_corp[["Symbol", "Date", "Dividend", "SplitFactor"]]
-            df_corp = df_corp.sort_values(["Symbol", "Date"])
+            df_corp = df_corp[["Symbol", "Date", "Dividend", "SplitFactor"]].sort_values(["Symbol", "Date"])
             return df_corp
 
         df_corp = _build_corp_actions_df()
 
-        df_trades_all = (
-            pd.DataFrame(self.trade_rows)
-            if self.trade_rows
-            else pd.DataFrame(
-                columns=[
-                    "Date", "Symbol", "ContractID", "Expiry", "Strike",
-                    "Type", "TradeQty", "TradePrice", "TradeNotional", "Spot",
-                    "IV", "Delta", "Gamma", "Vega", "Theta",
-                ]
-            )
-        )
-
-        # --- Event-level PnL sheet (entry->exit window) ---
+        # Prepare event-level PnL summary (for earnings mode, entry->exit window PnL)
         event_pnl_rows = []
         for sym, mapping in self.strategy.entry_exit_map.items():
             for entry_date, meta in mapping.items():
-                exit_date = meta["exit_date"]
-                event_day = meta["event_day"]
+                exit_date = meta.get("exit_date")
+                event_day = meta.get("event_day")
                 timing = meta.get("timing", "UNKNOWN")
-
                 if exit_date is None:
                     continue
-
-                mask = (
-                        (df["Symbol"] == sym) &
-                        (df["Date"] >= entry_date) &
-                        (df["Date"] <= exit_date)
-                )
+                mask = (df["Symbol"] == sym) & (df["Date"] >= entry_date) & (df["Date"] <= exit_date)
                 df_window = df[mask]
                 if df_window.empty:
                     continue
-
                 event_pnl_rows.append({
                     "Symbol": sym,
                     "EntryDate": entry_date,
@@ -1822,160 +1804,88 @@ class Backtester:
                     "EventWindowPnL_deltaHedge": df_window["PnL_deltaHedge"].sum(),
                     "EventWindowPnL_TC": df_window["PnL_TC"].sum(),
                 })
+        df_event_pnl = pd.DataFrame(event_pnl_rows) if event_pnl_rows else pd.DataFrame(columns=[
+            "Symbol", "EntryDate", "EventDay", "ExitDate", "Timing",
+            "EventWindowPnL", "EventWindowPnL_vega", "EventWindowPnL_gamma",
+            "EventWindowPnL_theta", "EventWindowPnL_deltaHedge", "EventWindowPnL_TC",
+        ])
 
-        df_event_pnl = (
-            pd.DataFrame(event_pnl_rows)
-            if event_pnl_rows
-            else pd.DataFrame(
-                columns=[
-                    "Symbol", "EntryDate", "EventDay", "ExitDate", "Timing",
-                    "EventWindowPnL", "EventWindowPnL_vega", "EventWindowPnL_gamma",
-                    "EventWindowPnL_theta", "EventWindowPnL_deltaHedge", "EventWindowPnL_TC",
-                ]
+        # Compute per-symbol event stats summary (hit ratios, etc.)
+        if not df_event_pnl.empty:
+            base = df_event_pnl.groupby("Symbol")["EventWindowPnL"].agg(
+                N_events="count",
+                Mean_EventPnL="mean",
+                Std_EventPnL="std",
+                Best_EventPnL="max",
+                Worst_EventPnL="min",
             )
-        )
-
-        # --- Per-symbol performance stats (EVENT_STATS) ---
-        if df_event_pnl.empty:
-            df_event_stats = pd.DataFrame(
-                columns=[
-                    "Symbol",
-                    "N_events",
-                    "Mean_EventPnL",
-                    "Std_EventPnL",
-                    "HitRatio",
-                    "Best_EventPnL",
-                    "Worst_EventPnL",
-                    "BMO_N",
-                    "BMO_Mean_EventPnL",
-                    "AMC_N",
-                    "AMC_Mean_EventPnL",
-                ]
-            )
-        else:
-            # base aggregates across all events
-            base = (
-                df_event_pnl
-                .groupby("Symbol")["EventWindowPnL"]
-                .agg(
-                    N_events="count",
-                    Mean_EventPnL="mean",
-                    Std_EventPnL="std",
-                    Best_EventPnL="max",
-                    Worst_EventPnL="min",
-                )
-            )
-
-            # hit ratio (fraction of events with positive pnl)
-            hit = (
-                df_event_pnl.assign(Positive=df_event_pnl["EventWindowPnL"] > 0)
-                .groupby("Symbol")["Positive"]
-                .mean()
-                .rename("HitRatio")
-            )
-
-            # BMO stats
-            bmo = (
-                df_event_pnl[df_event_pnl["Timing"] == "BMO"]
-                .groupby("Symbol")["EventWindowPnL"]
-                .agg(
-                    BMO_N="count",
-                    BMO_Mean_EventPnL="mean",
-                )
-            )
-
-            # AMC stats
-            amc = (
-                df_event_pnl[df_event_pnl["Timing"] == "AMC"]
-                .groupby("Symbol")["EventWindowPnL"]
-                .agg(
-                    AMC_N="count",
-                    AMC_Mean_EventPnL="mean",
-                )
-            )
-
-            df_event_stats = (
-                base
-                .join(hit, how="left")
-                .join(bmo, how="left")
-                .join(amc, how="left")
-                .reset_index()  # Symbol back as a column
-            )
-
-            # for symbols without BMO/AMC, counts = 0
+            hit = (df_event_pnl.assign(Positive=df_event_pnl["EventWindowPnL"] > 0)
+                   .groupby("Symbol")["Positive"].mean().rename("HitRatio"))
+            bmo = (df_event_pnl[df_event_pnl["Timing"] == "BMO"]
+                   .groupby("Symbol")["EventWindowPnL"].agg(BMO_N="count", BMO_Mean_EventPnL="mean"))
+            amc = (df_event_pnl[df_event_pnl["Timing"] == "AMC"]
+                   .groupby("Symbol")["EventWindowPnL"].agg(AMC_N="count", AMC_Mean_EventPnL="mean"))
+            df_event_stats = base.join(hit, how="left").join(bmo, how="left").join(amc, how="left").reset_index()
             for col in ["BMO_N", "AMC_N"]:
                 if col in df_event_stats.columns:
                     df_event_stats[col] = df_event_stats[col].fillna(0).astype(int)
+        else:
+            df_event_stats = pd.DataFrame(columns=[
+                "Symbol", "N_events", "Mean_EventPnL", "Std_EventPnL", "HitRatio",
+                "Best_EventPnL", "Worst_EventPnL", "BMO_N", "BMO_Mean_EventPnL", "AMC_N", "AMC_Mean_EventPnL"
+            ])
 
+        # Write results to Excel with multiple sheets
         with pd.ExcelWriter(OUT_PNL_EXCEL, engine="xlsxwriter") as writer:
-            # 1) PORTFOLIO
-            out_portfolio = pivot_equity.reset_index()
-            out_portfolio.to_excel(writer, sheet_name="PORTFOLIO", index=False)
-
-            # 2) EVENT_PNL (right after portfolio)
+            pivot_equity.reset_index().to_excel(writer, sheet_name="PORTFOLIO", index=False)
             df_event_pnl.to_excel(writer, sheet_name="EVENT_PNL", index=False)
-
-            # 2b) EVENT_STATS (per-name summary)
             df_event_stats.to_excel(writer, sheet_name="EVENT_STATS", index=False)
-
-            # 3) CONFIG
             df_config.to_excel(writer, sheet_name="CONFIG", index=False)
-
-            # 4) EARNINGS
             df_earn.to_excel(writer, sheet_name="EARNINGS", index=False)
-
-            # 5) CORP_ACTIONS
-            df_corp[df_corp['SplitFactor']>1].to_excel(writer, sheet_name="CORP_ACTIONS", index=False)
-
-            # 6) ALL_TRADES
-            if not df_trades_all.empty:
-                df_trades_all.sort_values(["Date", "Symbol"]).to_excel(
-                    writer, sheet_name="ALL_TRADES", index=False
-                )
-            # 6b) ALL TRADES WHEN ROLL STRAT
+            df_corp[df_corp["SplitFactor"] != 1.0].to_excel(writer, sheet_name="CORP_ACTIONS", index=False)
+            if not self.trade_rows:
+                df_trades_all = pd.DataFrame(columns=[
+                    "Date", "Symbol", "ContractID", "Expiry", "Strike", "Type",
+                    "TradeQty", "TradePrice", "TradeNotional", "Spot", "IV", "Delta", "Gamma", "Vega", "Theta", "CloseDate"
+                ])
+            else:
+                df_trades_all = pd.DataFrame(self.trade_rows)
+            df_trades_all.sort_values(["Date", "Symbol"]).to_excel(writer, sheet_name="ALL_TRADES", index=False)
+            # For rolling strategy, output entry log if available
             if self.config.get("strategy_mode") == "rolling" and self.rolling_entries_log:
-                df_roll = pd.DataFrame(self.rolling_entries_log)
-                df_roll.to_excel(writer, sheet_name="ROLL_ENTRIES", index=False)
-            # 7) Per-symbol sheets
+                pd.DataFrame(self.rolling_entries_log).to_excel(writer, sheet_name="ROLL_ENTRIES", index=False)
+
+            if self.config.get("strategy_mode") == "rolling" and self.roll_portfolio_rows:
+                df_roll_all = pd.DataFrame(self.roll_portfolio_rows)
+            else:
+                df_roll_all = pd.DataFrame(
+                    columns=[
+                        "Date", "Symbol", "LotID", "ContractID",
+                        "EntryDate", "ExitDate", "Expiry", "Strike", "Type", "Qty",
+                        "Mid", "MTM", "IV", "Delta", "Gamma", "Vega", "Theta", "Spot",
+                    ]
+                )
+
+            # Per-symbol sheets for daily PnL and trades
             for sym in self.symbols:
                 df_sym = df[df["Symbol"] == sym].copy()
                 if not df_sym.empty:
-                    sheet = sym[:31]
-                    df_sym.to_excel(writer, sheet_name=sheet, index=False)
+                    df_sym.to_excel(writer, sheet_name=sym[:31], index=False)
+                df_tr_sym = df_trades_all[df_trades_all["Symbol"] == sym].copy()
+                if not df_tr_sym.empty:
+                    df_tr_sym.to_excel(writer, sheet_name=f"{sym}_TRADES"[:31], index=False)
 
-                if not df_trades_all.empty:
-                    df_tr_sym = df_trades_all[df_trades_all["Symbol"] == sym].copy()
-                    if not df_tr_sym.empty:
-                        sheet_tr = f"{sym}_TRADES"[:31]
-                        df_tr_sym.to_excel(writer, sheet_name=sheet_tr, index=False)
-
+                if not df_roll_all.empty:
+                    df_roll_sym = df_roll_all[df_roll_all["Symbol"] == sym].copy()
+                    if not df_roll_sym.empty:
+                        df_roll_sym.to_excel(
+                            writer,
+                            sheet_name=f"{sym}_ROLL_PTF"[:31],  # e.g. TICKER_ROLL_PTF
+                            index=False,
+                        )
         print(f"[INFO] Backtest results written to {OUT_PNL_EXCEL}")
 
-    def build_new_lots_for_date(
-        self,
-        date: pd.Timestamp,
-        market: MarketData,
-        symbol_states: Dict[str, TickerState],
-    ) -> List[LotSpec]:
-        """
-        Return the list of NEW lots to open on this date across all symbols.
-        May be empty.
-        """
-        raise NotImplementedError
-
-# ============================================================
-# ============================= MAIN =========================
-# ============================================================
-
+# If run as a script, execute backtest
 if __name__ == "__main__":
     bt = Backtester(BACKTEST_CONFIG, SYMBOLS)
-    # If you want line_profiler:
-    # if LineProfiler is not None:
-    # lp = LineProfiler()
-    # lp.add_function(Strategy._compute_rolling_option_targets)
-    # # lp.add_function(Strategy.compute_target_positions)
-    # lp_wrapper = lp(bt.run)
-    # lp_wrapper()
-    # lp.print_stats()
-    # else:
     bt.run()
