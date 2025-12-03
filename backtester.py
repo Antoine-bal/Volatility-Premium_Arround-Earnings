@@ -24,15 +24,15 @@ except NameError:  # pragma: no cover
 # ===================== CONFIG SECTION =======================
 # ============================================================
 
-# SYMBOLS = [
-#     "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
-#     "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
-#     "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
-# ]
-
 SYMBOLS = [
-"NVDA","MSFT"
+    "NVDA","MSFT","AAPL","AMZN","META","AVGO","GOOGL","GOOG","BRK.B","TSLA","JPM","V","LLY","NFLX","XOM","MA","WMT",
+    "COST","ORCL","JNJ","HD","PG","ABBV","BAC","UNH","CRM","ADBE","PYPL","AMD","INTC","CSCO","MCD","NKE","WFC","CVX",
+    "PEP","KO","DIS","BA","MRK","MO","IBM","T","GM","CAT","UPS","DOW","PLTR","TXN","LIN","AMAT"
 ]
+
+# SYMBOLS = [
+# "NVDA","MSFT"
+# ]
 
 START_DATE = pd.Timestamp("2020-01-01")
 END_DATE   = pd.Timestamp("2025-11-16")
@@ -124,87 +124,62 @@ def _flatten_config_dict(d: dict, prefix: str = "") -> List[Dict[str, Any]]:
             rows.append({"Key": key, "Value": v})
     return rows
 
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Any
+import pandas as pd
+import numpy as np
+
+# ------------------------------------------------------------
+# Canonical portfolio object
+# ------------------------------------------------------------
+
 @dataclass
-class LotSpec:
+class RollingPtf:
     """
-    Strategy-level description of ONE new lot to open today.
-    The backtester will turn this into a concrete lot_id + positions.
+    One 'portfolio slice' opened on entry_date and closed on exit_date.
+
+    It may contain several contracts (legs), all opened at entry_date and
+    all closed at exit_date (unless they hit expiry earlier).
     """
+    ptf_id: int
     symbol: str
-    contract_id: str        # unique key for option
-    expiry: pd.Timestamp
-    strike: float
-    opt_type: str           # "C" or "P"
     entry_date: pd.Timestamp
     exit_date: pd.Timestamp
-    qty: float              # signed
+
+    contract_ids: List[str]        # option identifier in chains
+    expiries: List[pd.Timestamp]
+    strikes: List[float]
+    opt_types: List[str]           # "C" or "P"
+    qtys: List[float]              # signed quantities (>0 long, <0 short)
+
+    # Previous-day pricing/greeks for decomposition
+    prev_prices: List[float] = field(default_factory=list)
+    prev_ivs: List[float] = field(default_factory=list)
+    prev_deltas: List[float] = field(default_factory=list)
+    prev_gammas: List[float] = field(default_factory=list)
+    prev_vegas: List[float] = field(default_factory=list)
+    prev_thetas: List[float] = field(default_factory=list)
+
     meta: Dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class LotInfo:
-    lot_id: int
-    symbol: str
-    contract_id: str
-    expiry: pd.Timestamp
-    strike: float
-    opt_type: str
-    entry_date: pd.Timestamp
-    exit_date: pd.Timestamp
-    qty: float
-    meta: Dict[str, Any] = field(default_factory=dict)
-
-@dataclass
-class RollingLot:
-    lot_id: int
-    contract_id: str
-    expiry: pd.Timestamp
-    strike: float
-    opt_type: str  # "C" or "P"
-    entry_date: pd.Timestamp
-    exit_date: pd.Timestamp
-    qty: float
-
-@dataclass
-class OptionPosition:
-    contract_id: str
-    symbol: str
-    expiry: pd.Timestamp
-    strike: float
-    opt_type: str  # "C" or "P"
-    qty: float
-    last_price: float
-    iv: float
-    delta: float
-    gamma: float
-    vega: float
-    theta: float
-    split_factor_since_open: float
-
-    # previous greeks for decomposition
-    prev_iv: Optional[float] = None
-    prev_delta: Optional[float] = None
-    prev_gamma: Optional[float] = None
-    prev_vega: Optional[float] = None
-    prev_theta: Optional[float] = None
-    prev_price: Optional[float] = None
 
 
 @dataclass
 class TickerState:
     equity: float
     cash: float
-    positions: Dict[str, OptionPosition] = field(default_factory=dict)
-    # Open rolling lots (for strategy_mode="rolling")
-    rolling_lots: List[RollingLot] = field(default_factory=list)
-    # Lot registry per ticker
-    lots: Dict[int, RollingLot] = field(default_factory=dict)
-    next_lot_id: int = 1
+
+    # Rolling portfolios for this symbol
+    rolling_ptfs: Dict[int, RollingPtf] = field(default_factory=dict)
+    next_ptf_id: int = 1
+
     # Stock hedge positions
-    stock_pos_close: float = 0.0   # shares held at end-of-day (t-1)
-    stock_pos_intraday: float = 0.0  # current stock position being adjusted
+    stock_pos_close: float = 0.0      # shares held at close of previous day
+    stock_pos_intraday: float = 0.0   # intraday position today
+
     last_spot: Optional[float] = None
     mtm_options: float = 0.0
     mtm_stock: float = 0.0
+
     cum_pnl: float = 0.0
     cum_pnl_vega: float = 0.0
     cum_pnl_gamma: float = 0.0
@@ -700,30 +675,50 @@ class Strategy:
         return mapping_global
 
     def compute_target_positions(
-        self,
-        date: pd.Timestamp,
-        symbol: str,
-        state: TickerState,
-        market: MarketData,
-        vega_target: float,
+            self,
+            date: pd.Timestamp,
+            symbol: str,
+            state: TickerState,
+            market: MarketData,
+            vega_target: float,
     ) -> List[Dict[str, Any]]:
-
         """
         Main public entry point.
 
-        It routes to more specific builders based on config:
-          - strategy_mode == "earnings":
-                earnings_structure in {"straddle", "strangle"}
-          - strategy_mode == "rolling":
-                single-leg rolling option (put/call) with generic selection
+        IMPORTANT: in the RollingPtf framework, this function's job is to
+        create RollingPtfs (portfolios) by calling
+            self.backtester.register_new_ptf(...)
+        when appropriate.
+
+        The backtester then loops over live RollingPtfs to compute PnL.
+        The *return value* is no longer used by the engine and is kept only
+        for backwards compatibility / debugging.
         """
 
         cfg = self.config
         mode = cfg.get("strategy_mode", "earnings")
 
+        # -----------------------------
+        # 1) Earnings mode
+        # -----------------------------
         if mode == "earnings":
+            # Use the existing earnings selection logic to pick the legs,
+            # then wrap them into a single RollingPtf whose entry/exit dates
+            # come from entry_exit_map (precomputed elsewhere).
             struct = cfg.get("earnings_structure", "straddle")
-            return self._compute_earnings_targets(
+
+            # If today is not an entry day, do nothing.
+            meta = self.entry_exit_map.get(symbol, {}).get(date)
+            if meta is None:
+                return []
+
+            exit_date = meta.get("exit_date")
+            if exit_date is None:
+                # No exit date → don't open anything.
+                return []
+
+            # Let the existing earnings logic pick & size the legs
+            legs = self._compute_earnings_targets(
                 date=date,
                 symbol=symbol,
                 state=state,
@@ -731,9 +726,49 @@ class Strategy:
                 vega_target=vega_target,
                 structure=struct,
             )
+            if not legs:
+                return []
 
+            # Wrap into a RollingPtf
+            ptf_legs = []
+            for leg in legs:
+                # legs can be dicts or pd.Series depending on your implementation
+                cid = leg["contractID"]
+                expiry = leg["expiration"]
+                strike = leg["strike"]
+                opt_type = leg["type"]
+                qty = float(leg["qty"])
+
+                ptf_legs.append(
+                    {
+                        "contract_id": cid,
+                        "expiry": expiry,
+                        "strike": strike,
+                        "type": opt_type,
+                        "qty": qty,
+                    }
+                )
+
+            self.backtester.register_new_ptf(
+                symbol=symbol,
+                entry_date=date,
+                exit_date=exit_date,
+                legs=ptf_legs,
+                meta={
+                    "mode": "earnings",
+                    "event_day": meta.get("event_day"),
+                },
+            )
+
+            return legs  # for debugging only
+
+        # -----------------------------
+        # 2) Rolling mode
+        # -----------------------------
         elif mode == "rolling":
-            return self._compute_rolling_option_targets(
+            # Rolling: one new RollingPtf per day (when possible),
+            # with exit_date = min(expiry, target_close_date).
+            return self._build_rolling_ptf_for_date(
                 date=date,
                 symbol=symbol,
                 state=state,
@@ -741,8 +776,10 @@ class Strategy:
                 vega_target=vega_target,
             )
 
+        # -----------------------------
+        # 3) Unknown / inactive mode
+        # -----------------------------
         else:
-            # Unknown / inactive mode → no trade
             return []
 
 
@@ -897,171 +934,6 @@ class Strategy:
         # So we pass vega_target as-is to _size_vega_legs.
         return self._size_vega_legs(symbol, legs, vega_target)
 
-    def _compute_rolling_option_targets(
-            self,
-            date: pd.Timestamp,
-            symbol: str,
-            state: TickerState,
-            market: MarketData,
-            vega_target: float,
-    ) -> List[Dict[str, Any]]:
-        """
-        Rolling single-leg option strategy with *lot tracking*.
-
-        Semantics:
-          - Each trading day:
-              * we keep existing lots whose exit_date >= today,
-              * we drop lots whose exit_date < today,
-              * we open ONE new lot (if possible) on a contract selected by:
-                    leg_type (P/C), maturity_index, select_by (delta/moneyness)
-              * new lot is sized to have vega ~= |vega_target| (per LOT),
-                sign chosen so that we are LONG vol (buy put/call).
-          - Target positions are the sum of all *open* lots per contract.
-        """
-
-        cfg = self.config
-        holding_days = int(cfg.get("rolling_holding_days", 20))
-        holding_days = max(1, holding_days)
-
-        # 1) Keep only lots that are still live as of 'date'
-        open_lots: List[RollingLot] = []
-        for lot in state.rolling_lots:
-            if date <= lot.exit_date:
-                open_lots.append(lot)
-
-        # 2) Try to create today's new lot
-        chain = market.get_chain(symbol, date)
-        if not chain.empty:
-            chain = chain.copy()
-            chain["expiration"] = pd.to_datetime(chain["expiration"]).dt.normalize()
-            chain["dte"] = (chain["expiration"] - date).dt.days
-
-            # Global DTE filter for rolling
-            min_dte = cfg.get("rolling_min_dte", 1)
-            max_dte = cfg.get("rolling_max_dte", 365)
-            chain = chain[(chain["dte"] >= min_dte) & (chain["dte"] <= max_dte)]
-
-            if not chain.empty:
-                leg_type = cfg.get("rolling_leg_type", "P").upper()
-                chain = chain[chain["type"].str.upper().str[0] == leg_type]
-
-                if not chain.empty:
-                    expiries = sorted(chain["expiration"].unique())
-                    if expiries:
-                        idx = cfg.get("rolling_maturity_index", 0)
-                        if idx >= len(expiries):
-                            idx = len(expiries) - 1
-                        expiry = expiries[idx]
-
-                        sub = chain[chain["expiration"] == expiry].copy()
-                        if not sub.empty:
-                            select_by = cfg.get("rolling_select_by", "delta")
-
-                            if select_by == "delta":
-                                if "delta" not in sub.columns:
-                                    sub = pd.DataFrame()
-                                else:
-                                    target_delta = cfg.get("rolling_target_delta", -0.20)
-                                    sub["sel_diff"] = (sub["delta"] - target_delta).abs()
-                            elif select_by == "moneyness":
-                                if "moneyness" not in sub.columns:
-                                    sub = pd.DataFrame()
-                                else:
-                                    target_mny = cfg.get("rolling_target_mny", 1.0)
-                                    sub["sel_diff"] = (sub["moneyness"] - target_mny).abs()
-                            else:
-                                sub = pd.DataFrame()
-
-                            if not sub.empty:
-                                row = sub.sort_values("sel_diff").iloc[0]
-
-                                vega_for_sizing = vega_target
-                                sized = self._size_vega_legs(symbol, [row], vega_for_sizing)
-
-                                if sized:
-                                    leg = sized[0]
-
-                                    # Compute exit_date on spot calendar
-                                    cal = market.get_spot_calendar(symbol)
-                                    if len(cal) > 0:
-                                        try:
-                                            cur_idx = cal.get_loc(date)
-                                        except KeyError:
-                                            cur_idx = cal.searchsorted(date)
-                                        exit_idx = cur_idx + holding_days - 1
-                                        if exit_idx >= len(cal):
-                                            exit_idx = len(cal) - 1
-                                        exit_date = cal[exit_idx]
-                                    else:
-                                        exit_date = date + pd.tseries.offsets.BDay(
-                                            holding_days - 1
-                                        )
-
-                                    # *** IMPORTANT: do NOT hold beyond expiry ***
-                                    expiry_dt = pd.to_datetime(leg["expiry"]).normalize()
-                                    exit_date = min(exit_date, expiry_dt)
-
-                                    lot_id = self.backtester.register_new_lot(
-                                        symbol=symbol,
-                                        contract_id=leg["contract_id"],
-                                        expiry=leg["expiry"],
-                                        strike=leg["strike"],
-                                        opt_type=leg["type"],
-                                        entry_date=date,
-                                        exit_date=exit_date,
-                                        qty=leg["qty"],
-                                        meta={"mode": "rolling"},
-                                    )
-
-                                    new_lot = RollingLot(
-                                        lot_id=lot_id,
-                                        contract_id=leg["contract_id"],
-                                        expiry=leg["expiry"],
-                                        strike=leg["strike"],
-                                        opt_type=leg["type"],
-                                        entry_date=date,
-                                        exit_date=exit_date,
-                                        qty=leg["qty"],
-                                    )
-                                    open_lots.append(new_lot)
-
-                                    self.backtester.rolling_entries_log.append({
-                                        "date": date,
-                                        "symbol": symbol,
-                                        "lot_id": lot_id,
-                                        "contract_id": leg["contract_id"],
-                                        "expiry": leg["expiry"],
-                                        "days_to_expiry_on_entry": int((leg["expiry"] - date).days),
-                                        "close_date": exit_date,
-                                        "strike": float(leg["strike"]),
-                                        "option_type": leg["type"],
-                                        "qty": float(leg["qty"]),
-                                        "delta_on_entry": float(row.get("delta", np.nan)),
-                                        "vega_on_entry": float(row.get("vega", np.nan)),
-                                        "vega_exposure": float(row.get("vega", np.nan))
-                                                         * float(leg["qty"]),
-                                        "note": "ROLL_ENTRY",
-                                    })
-
-        # Update state with currently open lots
-        state.rolling_lots = open_lots
-
-        # 3) Aggregate open lots per contract -> target positions
-        by_cid: Dict[str, Dict[str, Any]] = {}
-        for lot in open_lots:
-            cid = lot.contract_id
-            if cid not in by_cid:
-                by_cid[cid] = {
-                    "contract_id": cid,
-                    "symbol": symbol,
-                    "expiry": lot.expiry,
-                    "strike": lot.strike,
-                    "type": lot.opt_type,
-                    "qty": 0.0,
-                }
-            by_cid[cid]["qty"] += lot.qty
-
-        return list(by_cid.values())
 
     def _build_straddle_targets(
         self,
@@ -1166,6 +1038,183 @@ class Strategy:
         ]
         return targets
 
+    def _build_rolling_ptf_for_date(
+        self,
+        date: pd.Timestamp,
+        symbol: str,
+        state: TickerState,
+        market: MarketData,
+        vega_target: float,
+    ) -> List[Dict[str, Any]]:
+        """
+        Build ONE RollingPtf for this (date, symbol) in rolling mode.
+
+        Logic:
+          - Look at today's option chain.
+          - Filter maturities by DTE and pick the maturity_index-th expiry.
+          - Within that expiry, select one leg (P or C) by delta or moneyness.
+          - Size the quantity so that portfolio vega ~= |vega_target| * rolling_direction.
+          - Set exit_date = min(expiry, target_close_date) where target_close_date
+            is 'rolling_holding_days' business days after entry (using a simple
+            business-day calendar).
+          - Call backtester.register_new_ptf(...) with a single-leg RollingPtf.
+
+        Returns a list of leg dicts (for debugging only); the backtester uses
+        the RollingPtf registry, not the return value.
+        """
+        cfg = self.config
+
+        # If no vega target → no trade
+        if vega_target is None or abs(vega_target) < 1e-12:
+            return []
+
+        chain = market.get_chain(symbol, date)
+        if chain is None or chain.empty:
+            return []
+
+        chain = chain.copy()
+        # Normalize column names we rely on
+        if "expiration" not in chain.columns:
+            if "expiry" in chain.columns:
+                chain["expiration"] = chain["expiry"]
+            else:
+                return []
+
+        # Compute DTE
+        chain["expiration"] = pd.to_datetime(chain["expiration"]).dt.normalize()
+        dte = (chain["expiration"] - date.normalize()).dt.days
+        chain["dte"] = dte
+
+        min_dte = int(cfg.get("rolling_min_dte", 1))
+        max_dte = int(cfg.get("rolling_max_dte", 365))
+        mask_dte = (chain["dte"] >= min_dte) & (chain["dte"] <= max_dte)
+        chain = chain[mask_dte]
+        if chain.empty:
+            return []
+
+        # Filter by option type (P/C)
+        leg_type = cfg.get("rolling_leg_type", "P").upper()[0]
+        chain = chain[chain["type"].str.upper().str[0] == leg_type]
+        if chain.empty:
+            return []
+
+        # Pick maturity by index
+        expiries = sorted(chain["expiration"].unique())
+        if not expiries:
+            return []
+
+        idx = int(cfg.get("rolling_maturity_index", 0))
+        if idx >= len(expiries):
+            idx = len(expiries) - 1
+        expiry = expiries[idx]
+
+        sub = chain[chain["expiration"] == expiry].copy()
+        if sub.empty:
+            return []
+
+        # Ensure we have moneyness if needed
+        select_by = cfg.get("rolling_select_by", "delta")
+        spot_today = market.get_spot(symbol, date)
+        if spot_today is None or not np.isfinite(spot_today):
+            return []
+
+        if select_by == "moneyness":
+            if "moneyness" not in sub.columns:
+                if "strike_eff" in sub.columns:
+                    sub["moneyness"] = sub["strike_eff"] / spot_today
+                else:
+                    sub["moneyness"] = sub["strike"] / spot_today
+
+        # Select the contract
+        if select_by == "delta":
+            if "delta" not in sub.columns:
+                return []
+            target_delta = float(cfg.get("rolling_target_delta", -0.20))
+            sub["delta_diff"] = (sub["delta"] - target_delta).abs()
+            chosen = sub.sort_values("delta_diff").iloc[0]
+        elif select_by == "moneyness":
+            target_mny = float(cfg.get("rolling_target_mny", 1.0))
+            sub["mny_diff"] = (sub["moneyness"] - target_mny).abs()
+            chosen = sub.sort_values("mny_diff").iloc[0]
+        else:
+            # Fallback: closest to ATM by moneyness
+            if "moneyness" not in sub.columns:
+                if "strike_eff" in sub.columns:
+                    sub["moneyness"] = sub["strike_eff"] / spot_today
+                else:
+                    sub["moneyness"] = sub["strike"] / spot_today
+            sub["mny_diff"] = (sub["moneyness"] - 1.0).abs()
+            chosen = sub.sort_values("mny_diff").iloc[0]
+
+        # Vega sizing
+        if "vega" not in chosen.index:
+            return []
+        vega_leg = float(chosen["vega"])
+        if not np.isfinite(vega_leg) or abs(vega_leg) < 1e-12:
+            return []
+
+        direction = float(cfg.get("rolling_direction", -1.0))  # e.g. -1 for short vol
+        total_vega = direction * abs(vega_target)
+        qty = total_vega / vega_leg  # vega_leg typically > 0
+
+        if abs(qty) < 1e-8:
+            return []
+
+        # Holding period & exit date: min(expiry, target_close_date)
+        holding_days = max(1, int(cfg.get("rolling_holding_days", 20)))
+
+        # Simple business-day calendar (Mon–Fri); you can replace with your own if needed
+        # Include 'date' itself as the first business day.
+        bdays = pd.bdate_range(start=date.normalize(), periods=holding_days)
+        target_close_date = bdays[-1]
+
+        expiry_date = pd.to_datetime(chosen["expiration"]).normalize()
+        exit_date = min(expiry_date, target_close_date)
+
+        # Build RollingPtf leg definition
+        leg_dict = {
+            "contract_id": chosen["contractID"],
+            "expiry": expiry_date,
+            "strike": float(chosen["strike"]),
+            "type": chosen["type"],
+            "qty": float(qty),
+        }
+
+        # Register portfolio
+        self.backtester.register_new_ptf(
+            symbol=symbol,
+            entry_date=date.normalize(),
+            exit_date=exit_date,
+            legs=[leg_dict],
+            meta={
+                "mode": "rolling",
+                "leg_type": leg_type,
+                "select_by": select_by,
+                "target_delta": cfg.get("rolling_target_delta"),
+                "target_mny": cfg.get("rolling_target_mny"),
+                "holding_days": holding_days,
+            },
+        )
+
+        # Optional: keep a log for Excel sheet "ROLL_ENTRIES"
+        if hasattr(self.backtester, "rolling_entries_log"):
+            self.backtester.rolling_entries_log.append(
+                {
+                    "Symbol": symbol,
+                    "EntryDate": date.normalize(),
+                    "ExitDate": exit_date,
+                    "ContractID": chosen["contractID"],
+                    "Expiry": expiry_date,
+                    "Strike": float(chosen["strike"]),
+                    "Type": chosen["type"],
+                    "Qty": float(qty),
+                    "DTE_Entry": int((expiry_date - date.normalize()).days),
+                    "TargetCloseDate": target_close_date,
+                }
+            )
+
+        # Return legs for debugging only
+        return [leg_dict]
 
 # ============================================================
 # ====================== BACKTEST ENGINE =====================
@@ -1175,23 +1224,19 @@ class Backtester:
     def __init__(self, config: dict, symbols: List[str]):
         self.config = config
         self.symbols = symbols
+
         self.market = MarketData(symbols)
         self.strategy = Strategy(config)
         self.strategy.backtester = self
-        self.strategy.build_entry_exit_map(self.market)
 
-        # Results storage
         self.daily_pnl_rows: List[Dict[str, Any]] = []
         self.trade_rows: List[Dict[str, Any]] = []
-        self.rolling_entries_log: List[Dict[str, Any]] = []
         self.roll_portfolio_rows: List[Dict[str, Any]] = []
 
-        # Global lot registry + live lots tracking
-        self.all_lots: Dict[int, Dict[str, Any]] = {}
-        self.live_lots_by_date: Dict[pd.Timestamp, List[int]] = {}
-        self._next_lot_id: int = 1
+        # Global registry of all portfolios (for Excel / debugging)
+        self.all_ptfs: Dict[int, Dict[str, Any]] = {}
+        self._next_ptf_id: int = 1
 
-        # Initialize state for each symbol
         self.state: Dict[str, TickerState] = {
             sym: TickerState(
                 equity=config["initial_equity_per_ticker"],
@@ -1199,6 +1244,7 @@ class Backtester:
             )
             for sym in symbols
         }
+        self.rolling_entries_log = []
 
     def run(self):
         all_dates = self._build_global_calendar()
@@ -1219,492 +1265,492 @@ class Backtester:
         all_dates = sorted(set().union(*[set(idx) for idx in calendars]))
         return pd.DatetimeIndex(all_dates)
 
-    def register_new_lot(
+    def get_live_ptfs_between(
+        self,
+        start_date: pd.Timestamp,
+        end_date: pd.Timestamp,
+        symbol: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Return meta rows for all RollingPtf that are live at any point in [start_date, end_date].
+
+        A ptf (entry_date, exit_date) is live on this interval iff:
+            entry_date <= end_date AND exit_date >= start_date.
+        """
+        if start_date > end_date:
+            start_date, end_date = end_date, start_date
+
+        rows: List[Dict[str, Any]] = []
+        for ptf_id, meta in self.all_ptfs.items():
+            if symbol is not None and meta["symbol"] != symbol:
+                continue
+            e1 = meta["entry_date"]
+            e2 = meta["exit_date"]
+            if (e1 <= end_date) and (e2 >= start_date):
+                rows.append(meta.copy())
+        return rows
+
+    def get_live_ptfs_on_date(
+        self,
+        date: pd.Timestamp,
+        symbol: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        return self.get_live_ptfs_between(date, date, symbol)
+
+    def register_new_ptf(
         self,
         symbol: str,
-        contract_id: str,
-        expiry: pd.Timestamp,
-        strike: float,
-        opt_type: str,
         entry_date: pd.Timestamp,
         exit_date: pd.Timestamp,
-        qty: float,
+        legs: List[Dict[str, Any]],
         meta: Optional[Dict[str, Any]] = None,
     ) -> int:
-        """Create a new lot_id, store it globally + per-ticker, and return lot_id."""
-        lot_id = self._next_lot_id
-        self._next_lot_id += 1
+        """
+        Register a new RollingPtf and store it both globally and in TickerState.
 
-        # Global registry for lot (for PnL attribution or debugging)
-        self.all_lots[lot_id] = {
-            "lot_id": lot_id,
+        legs: list of dicts with at least:
+            - contract_id
+            - expiry
+            - strike
+            - type ("C"/"P")
+            - qty
+        """
+        ptf_id = self._next_ptf_id
+        self._next_ptf_id += 1
+
+        contract_ids = [str(leg["contract_id"]) for leg in legs]
+        expiries = [pd.to_datetime(leg["expiry"]).normalize() for leg in legs]
+        strikes = [float(leg["strike"]) for leg in legs]
+        opt_types = [str(leg["type"]).upper()[0] for leg in legs]
+        qtys = [float(leg["qty"]) for leg in legs]
+        n = len(legs)
+
+        meta = meta or {}
+
+        # Global flat metadata
+        meta_row = {
+            "ptf_id": ptf_id,
             "symbol": symbol,
-            "contract_id": contract_id,
-            "expiry": expiry,
-            "strike": float(strike),
-            "opt_type": opt_type,
             "entry_date": entry_date,
             "exit_date": exit_date,
-            "qty": float(qty),
-            "meta": meta or {},
+            "contract_ids": contract_ids,
+            "expiries": expiries,
+            "strikes": strikes,
+            "opt_types": opt_types,
+            "qtys": qtys,
+            "meta": meta,
         }
-        # Per-ticker registry of lot
+        self.all_ptfs[ptf_id] = meta_row
+
         st = self.state[symbol]
-        lot = RollingLot(
-            lot_id=lot_id,
-            contract_id=contract_id,
-            expiry=expiry,
-            strike=float(strike),
-            opt_type=opt_type,
+        ptf = RollingPtf(
+            ptf_id=ptf_id,
+            symbol=symbol,
             entry_date=entry_date,
             exit_date=exit_date,
-            qty=float(qty),
+            contract_ids=contract_ids,
+            expiries=expiries,
+            strikes=strikes,
+            opt_types=opt_types,
+            qtys=qtys,
+            prev_prices=[0.0] * n,
+            prev_ivs=[0.0] * n,
+            prev_deltas=[0.0] * n,
+            prev_gammas=[0.0] * n,
+            prev_vegas=[0.0] * n,
+            prev_thetas=[0.0] * n,
+            meta=meta,
         )
-        st.lots[lot_id] = lot
-        return lot_id
+        st.rolling_ptfs[ptf_id] = ptf
+        return ptf_id
 
-    @profile
+
+    def _apply_split_to_ptfs(self, symbol: str, date: pd.Timestamp) -> None:
+        """
+        Handle stock splits for:
+          - all live RollingPtfs on this (symbol, date)
+          - the stock hedge position
+          - last_spot (so the split doesn't look like a huge price move)
+
+        Conventions:
+          - split_factor = 1.0 on normal days
+          - split_factor = k (>1) on split days (e.g. 4.0 for 4-for-1)
+        """
+        split_factor = self.market.get_split_factor(symbol, date)
+
+        # Nothing to do if no split on this date
+        if not np.isfinite(split_factor) or abs(split_factor - 1.0) < 1e-12:
+            return
+
+        st = self.state[symbol]
+
+        # ------------------------------
+        # 1) Adjust all live option ptfs
+        # ------------------------------
+        for ptf_id, ptf in st.rolling_ptfs.items():
+            # Only ptfs that are actually live on this date
+            if not (ptf.entry_date <= date <= ptf.exit_date):
+                continue
+
+            if not ptf.qtys:
+                continue
+
+            # New strikes: divide by split_factor
+            ptf.strikes = [float(s) / split_factor for s in ptf.strikes]
+            # New quantities: multiply by split_factor
+            ptf.qtys    = [float(q) * split_factor for q in ptf.qtys]
+
+            # Keep global metadata in sync (for Excel / debugging)
+            meta = self.all_ptfs.get(ptf_id)
+            if meta is not None:
+                meta["strikes"] = list(ptf.strikes)
+                meta["qtys"]    = list(ptf.qtys)
+
+            # Optional: we could also reset greek caches here to avoid
+            # attributing any PnL to the mechanical split in the greek
+            # decomposition. Minimal & safe behaviour:
+            ptf.prev_deltas = [0.0] * len(ptf.prev_deltas)
+            ptf.prev_gammas = [0.0] * len(ptf.prev_gammas)
+            ptf.prev_vegas  = [0.0] * len(ptf.prev_vegas)
+            ptf.prev_thetas = [0.0] * len(ptf.prev_thetas)
+            # prev_prices / prev_ivs are not used in PnL_total, so we
+            # can leave them as is or adjust later if needed.
+
+        # ------------------------------
+        # 2) Adjust stock hedge position
+        # ------------------------------
+        # If we were long 10 shares and we get a 4-for-1 split,
+        # we must now be long 40 shares at quarter price. That’s how
+        # we avoid creating fake PnL from the hedge.
+        st.stock_pos_close     *= split_factor
+        st.stock_pos_intraday  *= split_factor
+
+        # ------------------------------
+        # 3) Adjust last_spot
+        # ------------------------------
+        # last_spot is used to compute dS = spot_today - last_spot
+        # for gamma / delta-hedge PnL. If we don't adjust it, the
+        # split shows up as a huge "real" move.
+        if st.last_spot is not None and np.isfinite(st.last_spot):
+            st.last_spot = st.last_spot / split_factor
+
+    def _apply_delta_hedge(
+        self,
+        symbol: str,
+        date: pd.Timestamp,
+        port_delta_today: float,
+        spot: float,
+    ) -> Dict[str, float]:
+        cfg = self.config
+        st = self.state[symbol]
+
+        if not cfg.get("delta_hedge", True):
+            st.stock_pos_intraday = st.stock_pos_close
+            return {"pnl_delta_hedge": 0.0, "pnl_tc_stock": 0.0}
+
+        tgt_stock_pos = -port_delta_today
+        trade_shares = tgt_stock_pos - st.stock_pos_close
+        pnl_delta_hedge = 0.0
+        pnl_tc_stock = 0.0
+
+        cost_model = cfg.get("cost_model", {})
+        stock_spread_bps = float(cost_model.get("stock_spread_bps", 0.0))
+
+        if abs(trade_shares) > 1e-10:
+            spread = stock_spread_bps / 1e4
+            trade_price = spot * (1 + spread) if trade_shares > 0 else spot * (1 - spread)
+            cash_change = -trade_shares * trade_price
+            st.cash += cash_change
+
+            # TC from spread
+            tc_stock = abs(trade_price - spot) * abs(trade_shares)
+            pnl_tc_stock += tc_stock
+
+        if st.last_spot is not None:
+            dS = spot - st.last_spot
+            pnl_delta_hedge = st.stock_pos_close * dS
+
+        st.stock_pos_intraday = tgt_stock_pos
+        st.stock_pos_close = tgt_stock_pos
+
+        return {"pnl_delta_hedge": pnl_delta_hedge, "pnl_tc_stock": pnl_tc_stock}
+
     def _process_symbol_date(self, symbol: str, date: pd.Timestamp):
         st = self.state[symbol]
         cfg = self.config
         equity_prev = st.equity
 
-        # Spot price for this date (already split-adjusted)
+        # 0) Spot
         spot = self.market.get_spot(symbol, date)
         if spot is None or not np.isfinite(spot):
             return
-        # Initialize option PnL breakdown variables for this day
+
+        # PnL diagnostics
         option_pnl_entry = 0.0
         option_pnl_close = 0.0
         option_pnl_expire = 0.0
+        pnl_gamma = 0.0
+        pnl_vega = 0.0
+        pnl_theta = 0.0
+        pnl_delta_hedge = 0.0
+        pnl_tc_opt = 0.0
+        pnl_tc_stock = 0.0
 
-        # ====== Corporate action handling (splits) ======
-        split_factor = self.market.get_split_factor(symbol, date)
-        if split_factor > 1:
-                # Adjust all existing positions and lots for stock split
-            for pos in st.positions.values():
-                pos.qty *= split_factor
-                pos.split_factor_since_open *= split_factor
-            # Adjust any open rolling lots for split (track adjusted strike and qty)
-            for lot in st.rolling_lots:
-                lot.qty *= split_factor
-                # lot.strike /= split_factor
+        # 1) Corporate actions (splits) – rescale strikes / qtys
+        self._apply_split_to_ptfs(symbol, date)
 
+        # 2) Compute vega target and let strategy create new PTFs
         mode = cfg.get("strategy_mode", "earnings")
-
-        # -------------------------------
-        # 1) Compute vega_target for today
-        # -------------------------------
         if mode == "earnings":
-            equity_scale = st.equity / cfg["initial_equity_per_ticker"] if cfg["reinvest"] else 1.0
+            equity_scale = (
+                st.equity / cfg["initial_equity_per_ticker"]
+                if cfg.get("reinvest", False)
+                else 1.0
+            )
             base_vega = cfg["base_vega_target"] * equity_scale
-            vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega) if cfg.get("use_signal", False) else base_vega
+            if cfg.get("use_signal", False):
+                vega_target = self.strategy.compute_signal_vega(date, symbol, base_vega)
+            else:
+                vega_target = base_vega
         elif mode == "rolling":
             holding_days = max(1, int(cfg.get("rolling_holding_days", 20)))
-            rolling_vega_per_lot = float(cfg.get("rolling_vega_per_lot") or (cfg["base_vega_target"] / holding_days))
-            equity_scale = st.equity / cfg["initial_equity_per_ticker"] if cfg.get("rolling_reinvest", False) else 1.0
-            vega_target = rolling_vega_per_lot * equity_scale
+            rolling_vega_per_ptf = float(
+                cfg.get("rolling_vega_per_lot") or (cfg["base_vega_target"] / holding_days)
+            )
+            equity_scale = (
+                st.equity / cfg["initial_equity_per_ticker"]
+                if cfg.get("rolling_reinvest", False)
+                else 1.0
+            )
+            vega_target = rolling_vega_per_ptf * equity_scale
         else:
             vega_target = 0.0
 
-        # -------------------------------
-        # 2) Determine target option positions
-        # -------------------------------
-        target_lines = self.strategy.compute_target_positions(date, symbol, st, self.market, vega_target)
+        # Strategy must call backtester.register_new_ptf(.) when it wants new PTFs.
+        self.strategy.compute_target_positions(date, symbol, st, self.market, vega_target)
 
-        # Earnings strategy: if today is an exit date, go flat
-        if mode == "earnings":
-            mapping_sym = self.strategy.entry_exit_map.get(symbol, {})
-            need_flat = any(meta_ev.get("exit_date") == date for meta_ev in mapping_sym.values())
-            if need_flat:
-                target_lines = []
-        else:
-            need_flat = False
+        # 3) Get live portfolios and today's chain
+        live_ptfs = [
+            ptf for ptf in st.rolling_ptfs.values()
+            if ptf.entry_date <= date <= ptf.exit_date
+        ]
 
-        # Get today's option chain and index by contract ID
         chain_today = self.market.get_chain(symbol, date)
         if not chain_today.empty:
             chain_today = chain_today.copy()
             chain_today["cid"] = chain_today["contractID"].astype(str)
-            chain_today_idx = chain_today.set_index("cid")
-            cids_today = set(chain_today["cid"])
+            chain_idx = chain_today.set_index("cid")
         else:
-            chain_today_idx = None
-            cids_today = set()
+            chain_idx = None
 
-        # -------------------------------
-        # 3) Handle expired or delisted positions (drop zombies)
-        # -------------------------------
-        for cid in list(st.positions.keys()):
-            pos = st.positions[cid]
-            # If we've reached or passed expiry, and the option is still in the book, force expiry payoff.
-            if pos.expiry <= date:
-                spot_expiry = self.market.get_spot(symbol, date)
-                if spot_expiry is None or not np.isfinite(spot_expiry):
-                    continue  # defensively skip if we have no spot
+        # 4) Entry / Close / Expiry cashflows from portfolios
+        cost_model = cfg.get("cost_model", {})
+        option_spread_bps = float(cost_model.get("option_spread_bps", 0.0))
+        commission_per_contract = float(cost_model.get("commission_per_contract", 0.0))
 
-                if pos.opt_type == "C":
-                    intrinsic = max(0.0, spot_expiry / pos.split_factor_since_open - pos.strike )
-                else:
-                    intrinsic = max(0.0, pos.strike / pos.split_factor_since_open- spot_expiry )
+        def _trade_price(mid: float, qty: float) -> float:
+            spread = option_spread_bps / 1e4
+            return mid * (1 + spread) if qty > 0 else mid * (1 - spread)
 
-                exp_cash = pos.qty * intrinsic  # short qty → negative if ITM
-                option_pnl_expire += exp_cash
-                st.cash += exp_cash
-                print('expired on', date, 'with expiry =',pos.expiry)
+        for ptf in live_ptfs:
+            n = len(ptf.contract_ids)
+            for i in range(n):
+                cid = ptf.contract_ids[i]
+                expiry = ptf.expiries[i]
+                strike = ptf.strikes[i]
+                opt_type = ptf.opt_types[i]
+                qty = ptf.qtys[i]
 
-                # Remove the position from the book (no MTM from tomorrow)
-                del st.positions[cid]
+                if qty == 0.0:
+                    # Already fully closed/expired
+                    continue
 
-        # Carry over previous Greeks and price for PnL decomposition
-        for pos in st.positions.values():
-            pos.prev_iv = pos.iv
-            pos.prev_delta = pos.delta
-            pos.prev_gamma = pos.gamma
-            pos.prev_vega = pos.vega
-            pos.prev_theta = pos.theta
-            pos.prev_price = pos.last_price
+                if chain_idx is None or cid not in chain_idx.index:
+                    continue
 
-        # -------------------------------
-        # 4) Build target quantity map (desired end-of-day positions)
-        # -------------------------------
-        target_qty: Dict[str, float] = {}
-        for t in target_lines:
-            cid = t["contract_id"]
-            target_qty[cid] = target_qty.get(cid, 0.0) + float(t["qty"])
-        if need_flat:
-            for cid in list(st.positions.keys()):
-                if cid not in target_qty:
-                    target_qty[cid] = 0.0
+                row_opt = chain_idx.loc[cid]
+                mid_price = float(row_opt["mid"])
 
-        cost_model = cfg["cost_model"]
-        option_spread_bps = cost_model["option_spread_bps"]
-        commission_per_contract = cost_model["commission_per_contract"]
+                # ---- Entry day: open qty ----
+                if date == ptf.entry_date:
+                    trade_qty = qty
+                    trade_price = _trade_price(mid_price, trade_qty)
+                    cash_change = -trade_qty * trade_price
+                    st.cash += cash_change
 
-        # Track transaction costs
-        pnl_tc_opt = 0.0  # options total TC (spread + commission)
-        pnl_tc_stock = 0.0  # stock hedge TC
+                    # TC: spread + commission
+                    tc_spread = abs(trade_price - mid_price) * abs(trade_qty)
+                    tc_comm = commission_per_contract * abs(trade_qty)
+                    pnl_tc_opt += tc_spread + tc_comm
+                    st.cash -= tc_comm
 
-        # Determine contracts we need to trade (union of current and target)
-        contract_ids = set(st.positions.keys()) | set(target_qty.keys())
+                    # For diagnostics: premium received (short) or paid (long)
+                    option_pnl_entry += -cash_change
 
-        # -------------------------------
-        # 5) Trade options to reach target positions
-        # -------------------------------
-        for cid in contract_ids:
-            cur_pos = st.positions.get(cid)
-            tgt_qty = target_qty.get(cid, 0.0) if mode == "rolling" else target_qty.get(cid, cur_pos.qty if cur_pos else 0.0)
-            if chain_today_idx is None:
-                continue
-            try:
-                row = chain_today_idx.loc[cid]
-            except KeyError:
-                continue
+                # ---- Exit day (non-expiry): close qty ----
+                if (date == ptf.exit_date) and (expiry > date) and (qty != 0.0):
+                    trade_qty = -qty
+                    trade_price = _trade_price(mid_price, trade_qty)
+                    cash_change = -trade_qty * trade_price
+                    st.cash += cash_change
 
-            mid_price = float(row["mid"])
-            iv = float(row.get("implied_volatility", np.nan))
-            delta = float(row.get("delta", 0.0))
-            gamma = float(row.get("gamma", 0.0))
-            vega = float(row.get("vega", 0.0))
-            theta = float(row.get("theta", 0.0))
-            opt_type = str(row["type"]).upper()[0]
-            expiry = pd.to_datetime(row["expiration"]).normalize()
-            strike = float(row["strike"])
+                    tc_spread = abs(trade_price - mid_price) * abs(trade_qty)
+                    tc_comm = commission_per_contract * abs(trade_qty)
+                    pnl_tc_opt += tc_spread + tc_comm
+                    st.cash -= tc_comm
 
-            cur_qty = cur_pos.qty if cur_pos is not None else 0.0
-            trade_qty = tgt_qty - cur_qty
+                    option_pnl_close += -cash_change
 
-            if abs(trade_qty) > 1e-10:
-                # Determine trade execution price (mid +/- spread)
-                spread = option_spread_bps / 1e4
-                trade_price = mid_price * (1 + spread) if trade_qty > 0 else mid_price * (1 - spread)
-                # Cash flow from trade (positive if cash received, negative if paid)
-                cash_change = -trade_qty * trade_price
-                st.cash += cash_change
+                    # VERY IMPORTANT: position is now flat
+                    ptf.qtys[i] = 0.0
 
-                # Transaction costs (spread slippage + commission)
-                tc_spread = abs(trade_price - mid_price) * abs(trade_qty)
-                tc_comm = abs(trade_qty) * commission_per_contract
-                pnl_tc_opt += (tc_spread + tc_comm)
+                # ---- Expiry payoff ----
+                if (expiry == date) and (ptf.entry_date <= date <= ptf.exit_date) and (ptf.qtys[i] != 0.0):
+                    qty_after_trade = ptf.qtys[i]
 
-                # Prepare trade record
-                trade_record = {
-                    "Date": date,
-                    "Symbol": symbol,
-                    "ContractID": cid,
-                    "Expiry": expiry,
-                    "Strike": strike,
-                    "Type": opt_type,
-                    "TradeQty": trade_qty,
-                    "TradePrice": trade_price,
-                    "TradeNotional": trade_qty * trade_price,
-                    "Spot": spot,
-                    "IV": iv,
-                    "Delta": delta,
-                    "Gamma": gamma,
-                    "Vega": vega,
-                    "Theta": theta,
-                }
-                # Allocate PnL to entry/close categories
-                if cur_pos is None:
-                    # Opened a new position
-                    option_pnl_entry += cash_change
-                    # Link CloseDate for this entry trade (from lot exit_date)
-                    close_date = None
-                    for lot in self.all_lots.values():
-                        if lot["symbol"] == symbol and lot["contract_id"] == cid and lot["entry_date"] == date:
-                            close_date = lot.get("exit_date")
-                            break
-                    if close_date is not None:
-                        trade_record["CloseDate"] = close_date
-                else:
-                    # Adjusting an existing position
-                    if cur_pos.qty * tgt_qty < 0:
-                        # Position side flipped (closed current and opened opposite)
-                        # Split cash_change into closing and opening parts by quantity ratio
-                        close_qty = -cur_qty  # amount closed to flatten current
-                        entry_qty = tgt_qty   # new position quantity after flip
-                        if abs(trade_qty) > 1e-8:
-                            cash_close = cash_change * (abs(close_qty) / abs(trade_qty))
-                            cash_entry = cash_change * (abs(entry_qty) / abs(trade_qty))
-                        else:
-                            cash_close = cash_entry = 0.0
-                        option_pnl_close += cash_close
-                        option_pnl_entry += cash_entry
-                        print('should not flip', date)
+                    if opt_type == "C":
+                        intrinsic = max(spot - strike, 0.0)
                     else:
-                        if abs(tgt_qty) > abs(cur_pos.qty):
-                            # Increased position in same direction
-                            option_pnl_entry += cash_change
-                            print('should not increase', date)
-                        elif abs(tgt_qty) < abs(cur_pos.qty):
-                            # Reduced position (partial or full close)
-                            option_pnl_close += cash_change
-                # Append trade record
-                self.trade_rows.append(trade_record)
+                        intrinsic = max(strike - spot, 0.0)
 
-            # Update or remove position in the book
-            if abs(tgt_qty) <= 1e-10:
-                # Target is zero -> close the position
-                if cid in st.positions:
-                    del st.positions[cid]
-            else:
-                if cur_pos is None:
-                    # New position opened
-                    st.positions[cid] = OptionPosition(
-                        contract_id=cid,
-                        symbol=symbol,
-                        expiry=expiry,
-                        strike=strike,
-                        opt_type=opt_type,
-                        qty=tgt_qty,
-                        last_price=mid_price,
-                        iv=iv,
-                        delta=delta,
-                        gamma=gamma,
-                        vega=vega,
-                        theta=theta,
-                        split_factor_since_open=1.0
-                    )
-                else:
-                    # Position exists, just update its fields and quantity
-                    cur_pos.qty = tgt_qty
-                    cur_pos.last_price = mid_price
-                    cur_pos.iv = iv
-                    cur_pos.delta = delta
-                    cur_pos.gamma = gamma
-                    cur_pos.vega = vega
-                    cur_pos.theta = theta
+                    payoff = intrinsic * qty_after_trade
+                    st.cash += payoff
+                    option_pnl_expire += payoff
 
-        # -------------------------------
-        # 6) Delta hedging (stock) + TC on stock
-        # -------------------------------
-        pnl_delta_hedge = 0.0
-        if cfg["delta_hedge"]:
-            port_delta = sum(pos.delta * pos.qty for pos in st.positions.values())
-            tgt_stock_pos = -port_delta
-            trade_shares = tgt_stock_pos - st.stock_pos_intraday
-            if abs(trade_shares) > 1e-8:
-                spread = cost_model["stock_spread_bps"] / 1e4
-                trade_price = spot * (1 + spread) if trade_shares > 0 else spot * (1 - spread)
-                cash_change = -trade_shares * trade_price
-                st.cash += cash_change
-                # Transaction cost for stock trade (spread only, commission assumed negligible or included above)
-                tc_stock = abs(trade_price - spot) * abs(trade_shares)
-                pnl_tc_stock += tc_stock
-            if st.last_spot is not None:
-                dS = spot - st.last_spot
-                pnl_delta_hedge = st.stock_pos_close * dS
-            st.stock_pos_intraday = tgt_stock_pos
-            st.stock_pos_close = tgt_stock_pos
-        else:
-            if st.last_spot is not None:
-                dS = spot - st.last_spot
-                pnl_delta_hedge = st.stock_pos_close * dS
+                    # After expiry you no longer hold the option
+                    ptf.qtys[i] = 0.0
 
-        # -------------------------------
-        # 7) Option PnL decomposition (Greek attribution for analysis only)
-        # -------------------------------
-        option_pnl = 0.0
-        port_gamma_prev = 0.0
-        port_vega_prev = 0.0
-        port_theta_prev = 0.0
-        dIV_weighted_num = 0.0
-        dIV_weighted_den = 0.0
-
+        # 5) Option MtM and greek exposures (live portfolios, AFTER cashflows)
+        mtm_options = 0.0
         port_delta_today = 0.0
         port_gamma_today = 0.0
         port_vega_today = 0.0
         port_theta_today = 0.0
 
-        for pos in st.positions.values():
-            if pos.prev_price is not None:
-                dP = (pos.last_price - pos.prev_price) * pos.qty
-                option_pnl += dP
+        for ptf in live_ptfs:
+            n = len(ptf.contract_ids)
+            for i in range(n):
+                cid = ptf.contract_ids[i]
+                qty = ptf.qtys[i]
 
-            if pos.prev_gamma is not None:
-                port_gamma_prev += pos.prev_gamma * pos.qty
-            if pos.prev_vega is not None:
-                port_vega_prev += pos.prev_vega * pos.qty
-            if pos.prev_theta is not None:
-                port_theta_prev += pos.prev_theta * pos.qty
+                # Legs closed/expired earlier are now qty=0
+                if qty == 0.0:
+                    continue
 
-            if (pos.prev_iv is not None and
-                    np.isfinite(pos.prev_iv) and np.isfinite(pos.iv)):
-                dIV = pos.iv - pos.prev_iv
-                w = abs(pos.prev_vega * pos.qty)
-                dIV_weighted_num += w * dIV
-                dIV_weighted_den += w
+                if chain_idx is None or cid not in chain_idx.index:
+                    continue
 
-            port_delta_today += pos.delta * pos.qty
-            port_gamma_today += pos.gamma * pos.qty
-            port_vega_today += pos.vega * pos.qty
-            port_theta_today += pos.theta * pos.qty
+                row_opt = chain_idx.loc[cid]
+                mid_price = float(row_opt["mid"])
+                iv = float(row_opt.get("implied_volatility", np.nan))
+                delta = float(row_opt.get("delta", 0.0))
+                gamma = float(row_opt.get("gamma", 0.0))
+                vega = float(row_opt.get("vega", 0.0))
+                theta = float(row_opt.get("theta", 0.0))
 
-        dS = 0.0
-        if st.last_spot is not None:
-            dS = spot - st.last_spot
-        dt = 1.0 / 252.0
-        dIV_eff = dIV_weighted_num / dIV_weighted_den if dIV_weighted_den > 0 else 0.0
+                mtm_options += qty * mid_price
+                port_delta_today += qty * delta
+                port_gamma_today += qty * gamma
+                port_vega_today += qty * vega
+                port_theta_today += qty * theta
 
-        pnl_gamma = 0.5 * port_gamma_prev * (dS ** 2)
-        pnl_vega = port_vega_prev * dIV_eff
-        pnl_theta = port_theta_prev * dt
+                # Previous day values for decomposition
+                prev_price = ptf.prev_prices[i]
+                prev_iv = ptf.prev_ivs[i]
+                prev_gamma = ptf.prev_gammas[i]
+                prev_vega = ptf.prev_vegas[i]
+                prev_theta = ptf.prev_thetas[i]
 
-        # -------------------------------
-        # 8) Mark-to-market & equity update
-        # -------------------------------
-        mtm_options = sum(pos.last_price * pos.qty for pos in st.positions.values())
-        mtm_stock = st.stock_pos_close * spot
+                dS = 0.0 if st.last_spot is None else (spot - st.last_spot)
+
+                # Gamma PnL
+                pnl_gamma += 0.5 * prev_gamma * (dS ** 2) * qty
+
+                # Vega PnL
+                if np.isfinite(iv) and np.isfinite(prev_iv):
+                    dIV = iv - prev_iv
+                    pnl_vega += prev_vega * dIV * qty
+
+                # Theta PnL (1 day)
+                pnl_theta += prev_theta * (1.0 / 252.0) * qty
+
+                # Update prev_* for next day
+                ptf.prev_prices[i] = mid_price
+                ptf.prev_ivs[i] = iv if np.isfinite(iv) else prev_iv
+                ptf.prev_deltas[i] = delta
+                ptf.prev_gammas[i] = gamma
+                ptf.prev_vegas[i] = vega
+                ptf.prev_thetas[i] = theta
 
         st.mtm_options = mtm_options
-        st.mtm_stock = mtm_stock
 
-        # Compute end-of-day equity from cash + MTM (realized + unrealized PnL)
-        st.equity = st.cash + mtm_options + mtm_stock
+        # 6) Stock hedge & MTM
+        #    IMPORTANT CHANGE vs your original version:
+        #    - We DO NOT set st.mtm_stock before hedging.
+        #    - We hedge first (which updates stock_pos_close & cash),
+        #      then compute MTM based on the new stock_pos_close.
+        hedge_res = self._apply_delta_hedge(symbol, date, port_delta_today, spot)
+        pnl_delta_hedge = hedge_res["pnl_delta_hedge"]
+        pnl_tc_stock = hedge_res["pnl_tc_stock"]
+
+        # Now mark the stock with the *post-hedge* position
+        st.mtm_stock = st.stock_pos_close * spot
+
+        # 7) Equity & PnL (source of truth)
+        st.equity = st.cash + st.mtm_options + st.mtm_stock
         pnl_total = st.equity - equity_prev
 
-        # Total transaction costs today
-        pnl_tc_total = pnl_tc_opt + pnl_tc_stock
-
-        # Update cumulative PnL trackers
         st.cum_pnl += pnl_total
-        st.cum_pnl_vega += pnl_vega
         st.cum_pnl_gamma += pnl_gamma
+        st.cum_pnl_vega += pnl_vega
         st.cum_pnl_theta += pnl_theta
         st.cum_pnl_delta_hedge += pnl_delta_hedge
-        st.cum_pnl_tc += pnl_tc_total
+        st.cum_pnl_tc += (pnl_tc_opt + pnl_tc_stock)
 
-        # Prepare daily PnL row with breakdown
-        row = {
-            "Date": date,
-            "Symbol": symbol,
-            "Equity": st.equity,
-            "Cash": st.cash,
-            "MTM_Options": st.mtm_options,
-            "MTM_Stock": st.mtm_stock,
-            "Spot": spot,
-            "DailyPnL": pnl_total,
-            "OptionPnL_Entry": option_pnl_entry,
-            "OptionPnL_Close": option_pnl_close,
-            "OptionPnL_Expire": option_pnl_expire,
-            "PnL_gamma": pnl_gamma,
-            "PnL_vega": pnl_vega,
-            "PnL_theta": pnl_theta,
-            "PnL_deltaHedge": pnl_delta_hedge,
-            "PnL_TC": pnl_tc_total,
-            "PnL_TC_Options": pnl_tc_opt,
-            "PnL_TC_Stock": pnl_tc_stock,
-            "CumPnL": st.cum_pnl,
-            "CumPnL_gamma": st.cum_pnl_gamma,
-            "CumPnL_vega": st.cum_pnl_vega,
-            "CumPnL_theta": st.cum_pnl_theta,
-            "CumPnL_deltaHedge": st.cum_pnl_delta_hedge,
-            "CumPnL_TC": st.cum_pnl_tc,
-            "Delta": port_delta_today,
-            "Gamma": port_gamma_today,
-            "Vega": port_vega_today,
-            "Theta": port_theta_today,
-        }
-        self.daily_pnl_rows.append(row)
         st.last_spot = spot
 
-        # Track live lot IDs for rolling strategy (for debugging or analysis)
-        if mode != "earnings":
-            live_ids = [lot.lot_id for lot in st.rolling_lots]
-            self.live_lots_by_date.setdefault(date, []).extend(live_ids)
-
-          # NEW: end-of-day portfolio snapshot per lot (rolling strategy)
-            if chain_today_idx is not None:
-                for lot in st.rolling_lots:
-                    cid = str(lot.contract_id)
-                    snap = {
-                        "Date": date,
-                        "Symbol": symbol,
-                        "LotID": lot.lot_id,
-                        "ContractID": cid,
-                        "EntryDate": lot.entry_date,
-                        "ExitDate": lot.exit_date,
-                        "Expiry": lot.expiry,
-                        "Strike": float(lot.strike),
-                        "Type": lot.opt_type,
-                        "Qty": float(lot.qty),
-                    }
-                    try:
-                        row_opt = chain_today_idx.loc[cid]
-                        mid = float(row_opt["mid"])
-                        iv = float(row_opt.get("implied_volatility", np.nan))
-                        delta = float(row_opt.get("delta", np.nan))
-                        gamma = float(row_opt.get("gamma", np.nan))
-                        vega = float(row_opt.get("vega", np.nan))
-                        theta = float(row_opt.get("theta", np.nan))
-                    except KeyError:
-                        # Option not in today chain (delisted / missing data)
-                        mid = np.nan
-                        iv = delta = gamma = vega = theta = np.nan
-
-                    snap.update(
-                        {
-                            "Mid": mid,
-                            "MTM": mid * snap["Qty"] if np.isfinite(mid) else np.nan,
-                            "IV": iv,
-                            "Delta": delta,
-                            "Gamma": gamma,
-                            "Vega": vega,
-                            "Theta": theta,
-                            "Spot": spot,
-                        }
-                    )
-                    self.roll_portfolio_rows.append(snap)
-
+        # 8) Daily row (same schema as original backtester)
+        self.daily_pnl_rows.append(
+            {
+                "Date": date,
+                "Symbol": symbol,
+                "Equity": st.equity,
+                "Cash": st.cash,
+                "MTM_Options": st.mtm_options,
+                "MTM_Stock": st.mtm_stock,
+                "Spot": spot,
+                "DailyPnL": pnl_total,
+                "OptionPnL_Entry": option_pnl_entry,
+                "OptionPnL_Close": option_pnl_close,
+                "OptionPnL_Expire": option_pnl_expire,
+                "PnL_gamma": pnl_gamma,
+                "PnL_vega": pnl_vega,
+                "PnL_theta": pnl_theta,
+                "PnL_deltaHedge": pnl_delta_hedge,
+                "PnL_TC": pnl_tc_opt + pnl_tc_stock,
+                "PnL_TC_Options": pnl_tc_opt,
+                "PnL_TC_Stock": pnl_tc_stock,
+                "CumPnL": st.cum_pnl,
+                "CumPnL_gamma": st.cum_pnl_gamma,
+                "CumPnL_vega": st.cum_pnl_vega,
+                "CumPnL_theta": st.cum_pnl_theta,
+                "CumPnL_deltaHedge": st.cum_pnl_delta_hedge,
+                "CumPnL_TC": st.cum_pnl_tc,
+                "Delta": port_delta_today,
+                "Gamma": port_gamma_today,
+                "Vega": port_vega_today,
+                "Theta": port_theta_today,
+            }
+        )
 
     def _export_results(self):
         if not self.daily_pnl_rows:
             print("[WARN] No PnL rows to export.")
             return
-        df = pd.DataFrame(self.daily_pnl_rows).sort_values(["Date", "Symbol"]).reset_index(drop=True)
-        df = df.bfill()  # forward-fill any NaNs for missing days per symbol
 
+        df = pd.DataFrame(self.daily_pnl_rows)
+        df = df.sort_values(["Symbol", "Date"])
+        df = df.bfill()  # forward-fill any NaNs for missing days per symbol
         # Pivot equity per symbol and compute total portfolio equity
         pivot_equity = df.pivot(index="Date", columns="Symbol", values="Equity")
         pivot_equity["PortfolioEquity"] = pivot_equity.sum(axis=1)
